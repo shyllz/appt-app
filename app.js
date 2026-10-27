@@ -28,6 +28,7 @@ const TICK = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3 3 7-
 
 // Sections of the app. Add new ones here as we build them.
 const SECTIONS = [
+  { id: 'home', label: 'Home' },
   { id: 'shopping', label: 'Shopping' },
   { id: 'projects', label: 'Projects' },
 ];
@@ -56,6 +57,11 @@ const state = {
   pfiles: [],
   editTask: null,
   editLink: null,
+  // Home (front page)
+  homeReady: false,
+  homeError: '',
+  household: null,   // { photo_path, photo_by, photo_at }
+  photoBusy: false,
 };
 
 const app = document.getElementById('app');
@@ -182,7 +188,7 @@ async function loadAll() {
   if (!state.lists.some((x) => x.id === state.currentListId)) {
     setCurrent(state.lists[0]?.id ?? null);
   }
-  await loadProjects();
+  await Promise.all([loadProjects(), loadHome()]);
   return true;
 }
 
@@ -276,11 +282,11 @@ function renderMain() {
   const me = state.profiles[uid()];
   app.innerHTML = `
     <header class="top">
-      <div class="brand">${ICON}<span>Home</span></div>
+      <a class="brand" href="#home" aria-label="Home">${ICON}</a>
       <nav class="sections" id="nav">
         ${SECTIONS.map((s) => `<button data-section="${s.id}">${esc(s.label)}</button>`).join('')}
       </nav>
-      <div class="me">${esc(me?.display_name)} · <button class="link" id="signout">Sign out</button></div>
+      <div class="me"><span class="nm">${esc(me?.display_name)} ·</span> <button class="link" id="signout">Sign out</button></div>
     </header>
     <main class="wrap" id="view"></main>`;
 
@@ -292,10 +298,11 @@ function renderMain() {
   renderView();
 }
 
-// Hash routes: #shopping, #projects, #projects/<id>, #projects/settings
+// Hash routes: #home, #shopping, #projects, #projects/<id>, #projects/settings
+// Opening the app without a hash lands on the front page.
 function parseRoute() {
   const [sec, sub] = location.hash.replace(/^#\/?/, '').split('/');
-  const section = SECTIONS.some((s) => s.id === sec) ? sec : (store('section') || 'shopping');
+  const section = SECTIONS.some((s) => s.id === sec) ? sec : 'home';
   return { section, sub: sub || null, key: `${section}/${sub || ''}` };
 }
 
@@ -309,7 +316,9 @@ function renderView() {
   }
   const changed = r.key !== state.route;
   state.route = r.key;
-  if (r.section === 'shopping') {
+  if (r.section === 'home') {
+    renderHome();
+  } else if (r.section === 'shopping') {
     if (state.view !== 'shopping') buildShopping();
     renderShopping();
   } else {
@@ -1449,6 +1458,295 @@ async function onProjectsSubmit(e) {
     }
   }
 }
+
+
+// ============================================================
+// ---------- Home (front page) ----------
+// ============================================================
+const PHOTO_BUCKET = 'home-photos';
+const CAMERA = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="12" cy="13" r="3.5" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>`;
+
+async function loadHome() {
+  const { data, error } = await sb.from('household').select('*').eq('id', 1).maybeSingle();
+  if (error) {
+    console.warn('Home photo not available:', error);
+    state.homeReady = false;
+    state.homeError = error.message;
+    return;
+  }
+  state.homeReady = true;
+  state.household = data || null;
+}
+
+function renderHome() {
+  const view = $('view');
+  if (state.view !== 'home') {
+    state.view = 'home';
+    view.onclick = onHomeClick;
+    view.onchange = onHomeChange;
+    view.onsubmit = null;
+  }
+  keepWhileRendering(view, () => { view.innerHTML = homeHTML(); });
+  fillPhoto();
+}
+
+function plural(n, one, many = one + 's') { return `${n} ${n === 1 ? one : many}`; }
+
+function addDays(n) {
+  const d = new Date();
+  d.setDate(d.getDate() + n);
+  return d.toLocaleDateString('sv-SE');
+}
+
+function homeHTML() {
+  const me = state.profiles[uid()];
+  const h = new Date().getHours();
+  const hello = h < 5 ? 'Good night' : h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
+  const dateLine = new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
+
+  // Shopping: everything not yet checked off, across all lists
+  const openItems = state.items.filter((i) => !i.checked);
+  const perList = state.lists
+    .map((l) => ({ l, n: openItems.filter((i) => i.list_id === l.id).length }))
+    .filter((x) => x.n);
+
+  // Projects: "live" = not done
+  const live = state.projects.filter((p) => p.status !== 'done');
+  const byStatus = STATUSES.filter((s) => s.id !== 'done')
+    .map((s) => ({ s, n: live.filter((p) => p.status === s.id).length }))
+    .filter((x) => x.n);
+
+  return `
+    <div class="hello">
+      <h1>${hello}${me ? `, ${esc(me.display_name)}` : ''}</h1>
+      <p class="muted">${esc(dateLine)}</p>
+    </div>
+
+    ${photoHTML()}
+
+    <div class="stats">
+      <div class="stat" data-act="go-shopping" role="link" tabindex="0">
+        <div class="stat-num">${openItems.length}</div>
+        <div class="stat-label">${openItems.length === 1 ? 'item' : 'items'} on the shopping list</div>
+        ${perList.length ? `<div class="stat-chips">${perList.map(({ l, n }) => `
+          <button class="mini" data-act="open-list" data-id="${l.id}">${l.emoji ? esc(l.emoji) + ' ' : ''}${esc(l.name)} <b>${n}</b></button>`).join('')}</div>`
+          : '<div class="stat-sub">All bought 🎉</div>'}
+        <span class="stat-go">Shopping →</span>
+      </div>
+      <div class="stat" data-act="go-projects" role="link" tabindex="0">
+        <div class="stat-num">${state.projectsReady ? live.length : '–'}</div>
+        <div class="stat-label">live ${live.length === 1 ? 'project' : 'projects'}</div>
+        ${byStatus.length ? `<div class="stat-chips">${byStatus.map(({ s, n }) =>
+          `<span class="status st-${s.id}">${n} ${esc(s.label.toLowerCase())}</span>`).join('')}</div>`
+          : `<div class="stat-sub">${state.projectsReady ? 'Nothing on the go' : 'Not set up yet'}</div>`}
+        <span class="stat-go">Projects →</span>
+      </div>
+    </div>
+
+    ${state.projectsReady ? todosHTML(live) : ''}`;
+}
+
+function photoHTML() {
+  if (!state.homeReady) {
+    return `<div class="hero empty-hero">
+      <p class="muted small">To add a shared photo here, run <code>supabase/03_home.sql</code> in Supabase → SQL Editor, then reload.</p>
+    </div>`;
+  }
+  const hh = state.household;
+  const busy = state.photoBusy ? '<div class="hero-busy">Uploading…</div>' : '';
+  const input = `<input type="file" accept="image/*" hidden data-act="photo">`;
+  if (!hh?.photo_path) {
+    return `<label class="hero empty-hero add-photo">
+      ${input}${busy}
+      <span class="cam">${CAMERA}</span>
+      <b>Add a photo</b>
+      <span class="muted small">Pick one from your camera roll – you both see it here</span>
+    </label>`;
+  }
+  const cached = photoCache.path === hh.photo_path ? photoCache.url : '';
+  return `<figure class="hero">
+      <img data-photo="${esc(hh.photo_path)}" ${cached ? `src="${esc(cached)}"` : ''} alt="Our home">
+      ${busy}
+      <div class="hero-actions">
+        <label class="hero-btn">${input}${CAMERA}<span>Change</span></label>
+        <button class="hero-btn" data-act="photo-remove" aria-label="Remove photo">×</button>
+      </div>
+      ${hh.photo_by ? `<figcaption>Photo by ${esc(personName(hh.photo_by))}${hh.photo_at ? ` · ${fmtDate(hh.photo_at.slice(0, 10))}` : ''}</figcaption>` : ''}
+    </figure>`;
+}
+
+function todosHTML(live) {
+  const liveIds = new Set(live.map((p) => p.id));
+  const open = state.ptasks.filter((t) => !t.done && liveIds.has(t.project_id)).sort(taskOrder);
+  // You first, then everyone else alphabetically, then Unassigned
+  const people = Object.values(state.profiles)
+    .sort((a, b) => (b.id === uid()) - (a.id === uid()) || a.display_name.localeCompare(b.display_name));
+  const known = new Set(people.map((p) => p.id));
+  const cols = [
+    ...people.map((p) => ({ key: p.id, name: p.display_name, tasks: open.filter((t) => t.assignee === p.id) })),
+    { key: 'none', name: 'Unassigned', tasks: open.filter((t) => !t.assignee || !known.has(t.assignee)), none: true },
+  ];
+  return `
+    <div class="listhead"><h1 class="h2">To-dos</h1></div>
+    <div class="todos">${cols.map(todoCard).join('')}</div>`;
+}
+
+function todoCard(c) {
+  const t0 = today();
+  const week = addDays(7);
+  const overdue = c.tasks.filter((t) => t.due_date && t.due_date < t0).length;
+  const soon = c.tasks.filter((t) => t.due_date && t.due_date >= t0 && t.due_date <= week).length;
+  const sub = [
+    overdue ? `<span class="overdue">${overdue} overdue</span>` : '',
+    soon ? `${soon} due this week` : '',
+  ].filter(Boolean).join(' · ');
+  const first = c.tasks.slice(0, 3);
+  const rest = c.tasks.slice(3);
+  return `
+    <section class="todo-card">
+      <div class="todo-head">
+        <span class="avatar ${c.none ? 'none' : ''}">${c.none ? '?' : esc([...c.name][0]?.toUpperCase() || '?')}</span>
+        <div class="todo-who"><h3>${esc(c.name)}</h3>${sub ? `<div class="meta">${sub}</div>` : ''}</div>
+        <span class="todo-count">${c.tasks.length}</span>
+      </div>
+      ${c.tasks.length ? `<ul class="todo-list">${first.map(todoRow).join('')}</ul>
+        ${rest.length ? `<details data-key="todos-${c.key}">
+          <summary>${plural(rest.length, 'more task')}</summary>
+          <ul class="todo-list">${rest.map(todoRow).join('')}</ul>
+        </details>` : ''}`
+        : `<p class="muted small pad">Nothing to do 🎉</p>`}
+    </section>`;
+}
+
+function todoRow(t) {
+  const p = byId(state.projects, t.project_id);
+  const overdue = t.due_date && t.due_date < today();
+  const meta = [
+    p ? esc(p.title) : '',
+    t.due_date ? `<span class="${overdue ? 'overdue' : ''}">${overdue ? 'Overdue · ' : 'Due '}${fmtDate(t.due_date)}</span>` : '',
+  ].filter(Boolean).join(' · ');
+  return `
+    <li data-id="${t.id}">
+      <button class="check" data-act="task-done" aria-label="Mark “${esc(t.text)}” as done">${TICK}</button>
+      <a class="body" href="#projects/${t.project_id}">
+        <div class="name">${esc(t.text)}</div>
+        ${meta ? `<div class="meta">${meta}</div>` : ''}
+      </a>
+    </li>`;
+}
+
+// ---------- Shared photo ----------
+const photoCache = { path: null, url: null, exp: 0 };
+
+async function fillPhoto() {
+  const img = $('view').querySelector('img[data-photo]');
+  if (!img) return;
+  const path = img.dataset.photo;
+  if (!(photoCache.path === path && photoCache.exp > Date.now() + 60000)) {
+    const { data, error } = await sb.storage.from(PHOTO_BUCKET).createSignedUrl(path, 86400);
+    if (error) return console.warn(error);
+    Object.assign(photoCache, { path, url: data.signedUrl, exp: Date.now() + 86400 * 1000 });
+  }
+  const cur = $('view').querySelector('img[data-photo]');
+  if (cur && cur.dataset.photo === path && cur.src !== photoCache.url) cur.src = photoCache.url;
+}
+
+// Resize to max 2000px and save as JPEG (keeps uploads small and fast)
+async function prepPhoto(file) {
+  if (!window.createImageBitmap || file.type === 'image/gif') return file;
+  try {
+    const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    const scale = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * scale);
+    c.height = Math.round(bmp.height * scale);
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(bmp, 0, 0, c.width, c.height);
+    const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.85));
+    return blob || file;
+  } catch { return file; } // e.g. HEIC on a browser that can't read it – upload as is
+}
+
+async function setHomePhoto(file) {
+  if (!file) return;
+  state.photoBusy = true;
+  renderView();
+  try {
+    const blob = await prepPhoto(file);
+    const type = blob.type || file.type || 'image/jpeg';
+    const ext = type === 'image/jpeg' ? 'jpg' : (file.name.split('.').pop() || 'img').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const path = `home/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const up = await sb.storage.from(PHOTO_BUCKET).upload(path, blob, { contentType: type });
+    if (up.error) throw up.error;
+    const old = state.household?.photo_path;
+    const row = { id: 1, photo_path: path, photo_by: uid(), photo_at: new Date().toISOString() };
+    const { error } = await sb.from('household').upsert(row);
+    if (error) { await sb.storage.from(PHOTO_BUCKET).remove([path]); throw error; }
+    state.household = { ...(state.household || {}), ...row };
+    if (old && old !== path) sb.storage.from(PHOTO_BUCKET).remove([old]);
+    toast('Photo updated');
+  } catch (err) {
+    toast(err.message || 'Upload failed');
+  }
+  state.photoBusy = false;
+  renderView();
+}
+
+async function removeHomePhoto() {
+  const old = state.household?.photo_path;
+  if (!old || !confirm('Remove the photo from the front page?')) return;
+  const row = { id: 1, photo_path: null, photo_by: null, photo_at: null };
+  const { error } = await sb.from('household').upsert(row);
+  if (error) return toast(error.message);
+  state.household = { ...(state.household || {}), ...row };
+  sb.storage.from(PHOTO_BUCKET).remove([old]);
+  renderView();
+}
+
+// ---------- Home actions ----------
+async function onHomeClick(e) {
+  const el = e.target.closest('[data-act]');
+  if (!el) return;
+  switch (el.dataset.act) {
+    case 'photo': return; // the file input handles itself
+    case 'photo-remove': return removeHomePhoto();
+    case 'open-list':
+      setCurrent(el.dataset.id);
+      location.hash = 'shopping';
+      return;
+    case 'go-shopping':
+      location.hash = 'shopping';
+      return;
+    case 'go-projects':
+      // Show the same "live" projects the count refers to
+      Object.assign(pv, { room: '', type: '', prio: '', status: 'active' });
+      store('pStatus', 'active');
+      location.hash = 'projects';
+      return;
+    case 'task-done': {
+      const id = el.closest('[data-id]')?.dataset.id;
+      if (!byId(state.ptasks, id)) return;
+      await dbUpdate('project_tasks', id, { done: true, done_by: uid(), done_at: new Date().toISOString() });
+      toast('Marked as done ✓');
+    }
+  }
+}
+
+function onHomeChange(e) {
+  const el = e.target;
+  if (el.type === 'file' && el.dataset.act === 'photo') {
+    const file = el.files[0];
+    el.value = '';
+    setHomePhoto(file);
+  }
+}
+
+// Keyboard: Enter on the summary cards
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && e.target.matches?.('.stat[data-act]')) e.target.click();
+});
 
 // Ctrl/Cmd+Enter adds a note
 document.addEventListener('keydown', (e) => {
