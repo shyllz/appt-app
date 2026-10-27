@@ -27,7 +27,10 @@ const ICON = `<svg viewBox="0 0 512 512" aria-hidden="true"><rect width="512" he
 const TICK = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3 3 7-7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
 // Sections of the app. Add new ones here as we build them.
-const SECTIONS = [{ id: 'shopping', label: 'Shopping' }];
+const SECTIONS = [
+  { id: 'shopping', label: 'Shopping' },
+  { id: 'projects', label: 'Projects' },
+];
 
 // ---------- State ----------
 const state = {
@@ -38,6 +41,21 @@ const state = {
   items: [],
   currentListId: store('currentListId'),
   channel: null,
+  view: null,        // which section's markup is currently in #view
+  route: null,       // last rendered hash route
+  // Projects section
+  projectsReady: false,
+  projectsError: '',
+  rooms: [],
+  ptypes: [],
+  projects: [],
+  ptasks: [],
+  plinks: [],
+  pcosts: [],
+  pnotes: [],
+  pfiles: [],
+  editTask: null,
+  editLink: null,
 };
 
 const app = document.getElementById('app');
@@ -146,6 +164,7 @@ async function loadAll() {
   if (!state.lists.some((x) => x.id === state.currentListId)) {
     setCurrent(state.lists[0]?.id ?? null);
   }
+  await loadProjects();
   return true;
 }
 
@@ -164,15 +183,14 @@ function scheduleRefresh() {
 
 async function refresh() {
   if (state.screen !== 'main') return;
-  if (await loadAll()) renderShopping();
+  if (await loadAll()) renderView();
 }
 
 function subscribe() {
   if (state.channel) return;
+  // One listener for every shared table (only tables added to the realtime publication send events)
   state.channel = sb.channel('household')
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'items' }, scheduleRefresh)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'lists' }, scheduleRefresh)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, scheduleRefresh)
+    .on('postgres_changes', { event: '*', schema: 'public' }, scheduleRefresh)
     .subscribe();
 }
 
@@ -236,16 +254,59 @@ function renderNameSetup() {
 
 function renderMain() {
   state.screen = 'main';
+  state.view = null;
   const me = state.profiles[uid()];
   app.innerHTML = `
     <header class="top">
       <div class="brand">${ICON}<span>Home</span></div>
-      <nav class="sections">
-        ${SECTIONS.map((s, i) => `<button class="${i === 0 ? 'active' : ''}">${esc(s.label)}</button>`).join('')}
+      <nav class="sections" id="nav">
+        ${SECTIONS.map((s) => `<button data-section="${s.id}">${esc(s.label)}</button>`).join('')}
       </nav>
       <div class="me">${esc(me?.display_name)} · <button class="link" id="signout">Sign out</button></div>
     </header>
-    <main class="wrap">
+    <main class="wrap" id="view"></main>`;
+
+  $('signout').onclick = () => sb.auth.signOut();
+  $('nav').onclick = (e) => {
+    const id = e.target.closest('[data-section]')?.dataset.section;
+    if (id) location.hash = id;
+  };
+  renderView();
+}
+
+// Hash routes: #shopping, #projects, #projects/<id>, #projects/settings
+function parseRoute() {
+  const [sec, sub] = location.hash.replace(/^#\/?/, '').split('/');
+  const section = SECTIONS.some((s) => s.id === sec) ? sec : (store('section') || 'shopping');
+  return { section, sub: sub || null, key: `${section}/${sub || ''}` };
+}
+
+window.addEventListener('hashchange', () => { if (state.screen === 'main') renderView(); });
+
+function renderView() {
+  const r = parseRoute();
+  store('section', r.section);
+  for (const b of document.querySelectorAll('#nav [data-section]')) {
+    b.classList.toggle('active', b.dataset.section === r.section);
+  }
+  const changed = r.key !== state.route;
+  state.route = r.key;
+  if (r.section === 'shopping') {
+    if (state.view !== 'shopping') buildShopping();
+    renderShopping();
+  } else {
+    if (changed) { state.editTask = null; state.editLink = null; }
+    renderProjects(r.sub, !changed);
+  }
+  if (changed) window.scrollTo(0, 0);
+}
+
+// ---------- Shopping section ----------
+function buildShopping() {
+  state.view = 'shopping';
+  const view = $('view');
+  view.onclick = view.onchange = view.onsubmit = null;
+  view.innerHTML = `
       <div class="chips" id="chips"></div>
       <div id="listhead"></div>
       <form id="add" class="add" autocomplete="off">
@@ -256,18 +317,13 @@ function renderMain() {
         </select>
         <button class="btn primary" type="submit">Add</button>
       </form>
-      <div id="items"></div>
-    </main>`;
-
-  $('signout').onclick = () => sb.auth.signOut();
+      <div id="items"></div>`;
   setupAddForm();
   $('chips').onclick = onChipClick;
   $('listhead').onclick = onListHeadClick;
   $('items').onclick = onItemsClick;
-  renderShopping();
 }
 
-// ---------- Shopping section ----------
 function renderShopping() {
   renderChips();
   renderListHead();
@@ -478,5 +534,909 @@ async function clearChecked() {
   const { error } = await sb.from('items').delete().eq('list_id', l.id).eq('checked', true);
   if (error) { toast(error.message); refresh(); }
 }
+
+// ============================================================
+// ---------- Projects section ----------
+// ============================================================
+const BUCKET = 'project-files';
+
+const STATUSES = [
+  { id: 'idea', label: 'Idea' },
+  { id: 'researching', label: 'Researching' },
+  { id: 'in_progress', label: 'In progress' },
+  { id: 'on_hold', label: 'On hold' },
+  { id: 'done', label: 'Done' },
+];
+const PRIORITIES = [
+  { id: 'high', label: 'High' },
+  { id: 'medium', label: 'Medium' },
+  { id: 'low', label: 'Low' },
+];
+const GROUPS = [
+  { id: 'room', label: 'Room' },
+  { id: 'status', label: 'Status' },
+  { id: 'type', label: 'Type' },
+  { id: 'priority', label: 'Priority' },
+];
+// Sort order inside a group: most "alive" first
+const STATUS_RANK = { in_progress: 0, researching: 1, idea: 2, on_hold: 3, done: 4 };
+const PRIO_RANK = { high: 0, medium: 1, low: 2 };
+const statusLabel = (id) => STATUSES.find((s) => s.id === id)?.label || id;
+const prioLabel = (id) => PRIORITIES.find((s) => s.id === id)?.label || id;
+
+// Supabase table → state key
+const TABLES = {
+  rooms: 'rooms', project_types: 'ptypes', projects: 'projects', project_tasks: 'ptasks',
+  project_links: 'plinks', project_costs: 'pcosts', project_notes: 'pnotes', project_files: 'pfiles',
+};
+
+const pv = {
+  group: store('pGroup') || 'room',
+  status: store('pStatus') || 'active',
+  room: '',
+  type: '',
+  prio: '',
+};
+
+// ---------- Data ----------
+async function loadProjects() {
+  const q = (t, ...order) => order.reduce((x, o) => x.order(o), sb.from(t).select('*'));
+  const res = await Promise.all([
+    q('rooms', 'position', 'created_at'),
+    q('project_types', 'position', 'created_at'),
+    q('projects', 'created_at'),
+    q('project_tasks', 'created_at'),
+    q('project_links', 'created_at'),
+    q('project_costs', 'created_at'),
+    sb.from('project_notes').select('*').order('created_at', { ascending: false }),
+    q('project_files', 'created_at'),
+  ]);
+  const err = res.find((r) => r.error)?.error;
+  if (err) {
+    console.warn('Projects not available:', err);
+    state.projectsReady = false;
+    state.projectsError = err.message;
+    return;
+  }
+  state.projectsReady = true;
+  [state.rooms, state.ptypes, state.projects, state.ptasks, state.plinks, state.pcosts, state.pnotes, state.pfiles] =
+    res.map((r) => r.data);
+}
+
+async function dbInsert(table, row) {
+  const { data, error } = await sb.from(table).insert(row).select().single();
+  if (error) { toast(error.message); return null; }
+  const arr = state[TABLES[table]];
+  if (!arr.some((x) => x.id === data.id)) {
+    if (table === 'project_notes') arr.unshift(data); else arr.push(data);
+  }
+  renderView();
+  return data;
+}
+
+async function dbUpdate(table, id, patch) {
+  const obj = state[TABLES[table]].find((x) => x.id === id);
+  if (obj) Object.assign(obj, patch);
+  renderView();
+  const { error } = await sb.from(table).update(patch).eq('id', id);
+  if (error) { toast(error.message); refresh(); return false; }
+  return true;
+}
+
+async function dbDelete(table, id) {
+  const key = TABLES[table];
+  state[key] = state[key].filter((x) => x.id !== id);
+  renderView();
+  const { error } = await sb.from(table).delete().eq('id', id);
+  if (error) { toast(error.message); refresh(); return false; }
+  return true;
+}
+
+// ---------- Small helpers ----------
+const byId = (arr, id) => arr.find((x) => x.id === id);
+const nextPos = (arr) => Math.max(-1, ...arr.map((x) => x.position ?? 0)) + 1;
+const today = () => new Date().toLocaleDateString('sv-SE'); // YYYY-MM-DD, local time
+const nok = new Intl.NumberFormat('nb-NO', { style: 'currency', currency: 'NOK', maximumFractionDigits: 0 });
+const kr = (n) => (n === null || n === undefined || n === '' ? '' : nok.format(Number(n)));
+
+function parseAmount(v) {
+  const t = String(v ?? '').replace(/\s|kr|nok/gi, '').replace(',', '.');
+  if (!t) return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function fmtDate(d) {
+  if (!d) return '';
+  const dt = new Date(d + 'T00:00');
+  const opts = { day: 'numeric', month: 'short' };
+  if (dt.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+  return dt.toLocaleDateString('en-GB', opts);
+}
+
+function fmtWhen(ts) {
+  return new Date(ts).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+
+function personName(id) {
+  if (!id) return '';
+  return state.profiles[id]?.display_name || 'someone';
+}
+
+function label(x) {
+  return x ? `${x.emoji ? esc(x.emoji) + ' ' : ''}${esc(x.name)}` : '';
+}
+
+// "🛏️ Bedroom" → { emoji: '🛏️', name: 'Bedroom' }
+function splitEmoji(text) {
+  const m = text.match(/^(\p{Extended_Pictographic}[️‍\p{Extended_Pictographic}]*)\s*(.*)$/u);
+  return m && m[2] ? { emoji: m[1], name: m[2].trim() } : { emoji: null, name: text.trim() };
+}
+
+function normalizeUrl(u) {
+  const t = u.trim();
+  if (!t) return '';
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(t) ? t : 'https://' + t;
+}
+
+function hostOf(u) {
+  try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return ''; }
+}
+
+function safeHref(u) {
+  return /^https?:\/\//i.test(u) ? esc(u) : '#';
+}
+
+// Escape, keep line breaks, and turn URLs into links
+function richText(s) {
+  return esc(s).replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+}
+
+function peopleOptions(selected, emptyLabel) {
+  const people = Object.values(state.profiles).sort((a, b) => a.display_name.localeCompare(b.display_name));
+  return `<option value="">${esc(emptyLabel)}</option>` + people.map((p) =>
+    `<option value="${p.id}" ${p.id === selected ? 'selected' : ''}>${esc(p.display_name)}${p.id === uid() ? ' (you)' : ''}</option>`).join('');
+}
+
+function catOptions(arr, selected, emptyLabel, newLabel) {
+  return `<option value="">${esc(emptyLabel)}</option>` +
+    arr.map((x) => `<option value="${x.id}" ${x.id === selected ? 'selected' : ''}>${label(x)}</option>`).join('') +
+    (newLabel ? `<option value="__new">${esc(newLabel)}</option>` : '');
+}
+
+function enumOptions(list, selected) {
+  return list.map((x) => `<option value="${x.id}" ${x.id === selected ? 'selected' : ''}>${esc(x.label)}</option>`).join('');
+}
+
+function projectStats(p) {
+  const tasks = state.ptasks.filter((t) => t.project_id === p.id);
+  const open = tasks.filter((t) => !t.done).sort(taskOrder);
+  const spent = state.pcosts.filter((c) => c.project_id === p.id).reduce((s, c) => s + Number(c.amount), 0);
+  return {
+    tasks, open, next: open[0],
+    done: tasks.length - open.length,
+    links: state.plinks.filter((l) => l.project_id === p.id).length,
+    files: state.pfiles.filter((f) => f.project_id === p.id).length,
+    spent,
+  };
+}
+
+// Open tasks: those with a due date first (earliest first), then in the order they were added
+function taskOrder(a, b) {
+  if (a.due_date && b.due_date) return a.due_date.localeCompare(b.due_date) || a.created_at.localeCompare(b.created_at);
+  if (a.due_date) return -1;
+  if (b.due_date) return 1;
+  return a.created_at.localeCompare(b.created_at);
+}
+
+function progressBar(done, total, over = false) {
+  const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  return `<div class="bar ${over ? 'over' : ''}"><span style="width:${pct}%"></span></div>`;
+}
+
+// Re-render without losing what someone is typing (realtime updates re-render the page)
+function keepWhileRendering(container, render) {
+  const vals = {};
+  const open = {};
+  const active = document.activeElement;
+  const inside = active && container.contains(active);
+  const focusKey = inside ? (active.dataset.keep || active.dataset.field) : null;
+  const focusVal = inside ? active.value : null;
+  let sel = null;
+  try { if (inside) sel = [active.selectionStart, active.selectionEnd]; } catch { /* not a text field */ }
+  container.querySelectorAll('[data-keep]').forEach((el) => { if (el.value) vals[el.dataset.keep] = el.value; });
+  container.querySelectorAll('details[data-key]').forEach((d) => { open[d.dataset.key] = d.open; });
+
+  render();
+
+  container.querySelectorAll('[data-keep]').forEach((el) => {
+    if (vals[el.dataset.keep] !== undefined) el.value = vals[el.dataset.keep];
+  });
+  container.querySelectorAll('details[data-key]').forEach((d) => {
+    if (open[d.dataset.key] !== undefined) d.open = open[d.dataset.key];
+  });
+  if (focusKey) {
+    const el = container.querySelector(`[data-keep="${focusKey}"], [data-field="${focusKey}"]`);
+    if (el) {
+      if (el.dataset.field && focusVal !== null && el.type !== 'file') el.value = focusVal;
+      el.focus();
+      try { if (sel && sel[0] !== null) el.setSelectionRange(sel[0], sel[1]); } catch { /* ignore */ }
+    }
+  }
+}
+
+// ---------- Rendering ----------
+function renderProjects(sub, keep) {
+  const view = $('view');
+  if (state.view !== 'projects') {
+    state.view = 'projects';
+    view.onclick = onProjectsClick;
+    view.onchange = onProjectsChange;
+    view.onsubmit = onProjectsSubmit;
+    keep = false;
+  }
+  const draw = () => {
+    if (!state.projectsReady) view.innerHTML = setupHTML();
+    else if (sub === 'settings') view.innerHTML = settingsHTML();
+    else if (sub) view.innerHTML = detailHTML(sub);
+    else view.innerHTML = listHTML();
+  };
+  if (keep) keepWhileRendering(view, draw); else draw();
+  if (sub && sub !== 'settings') fillSigned();
+}
+
+function setupHTML() {
+  return `
+    <div class="panel setup">
+      <h1>Projects</h1>
+      <p>The projects section needs its database tables first.</p>
+      <ol>
+        <li>Open Supabase → <b>SQL Editor</b>.</li>
+        <li>Paste the contents of <code>supabase/02_projects.sql</code> and press <b>Run</b>.</li>
+        <li>Come back here and reload the page.</li>
+      </ol>
+      <p class="muted small">Details: ${esc(state.projectsError)}</p>
+    </div>`;
+}
+
+// ----- List view -----
+function filteredProjects() {
+  return state.projects.filter((p) => {
+    if (pv.status === 'active' && p.status === 'done') return false;
+    if (pv.status !== 'active' && pv.status !== 'all' && p.status !== pv.status) return false;
+    if (pv.room && (pv.room === 'none' ? p.room_id : p.room_id !== pv.room)) return false;
+    if (pv.type && (pv.type === 'none' ? p.type_id : p.type_id !== pv.type)) return false;
+    if (pv.prio && p.priority !== pv.prio) return false;
+    return true;
+  });
+}
+
+function groupProjects(list) {
+  const sortFn = (a, b) => PRIO_RANK[a.priority] - PRIO_RANK[b.priority]
+    || STATUS_RANK[a.status] - STATUS_RANK[b.status]
+    || a.title.localeCompare(b.title);
+  let groups;
+  if (pv.group === 'status') {
+    groups = STATUSES.map((s) => ({ key: s.id, title: s.label, items: list.filter((p) => p.status === s.id) }));
+  } else if (pv.group === 'priority') {
+    groups = PRIORITIES.map((s) => ({ key: s.id, title: `${s.label} priority`, items: list.filter((p) => p.priority === s.id) }));
+  } else {
+    const [arr, field, none] = pv.group === 'type'
+      ? [state.ptypes, 'type_id', 'No type'] : [state.rooms, 'room_id', 'No room'];
+    groups = arr.map((x) => ({ key: x.id, title: label(x), raw: true, items: list.filter((p) => p[field] === x.id) }));
+    groups.push({ key: 'none', title: none, items: list.filter((p) => !arr.some((x) => x.id === p[field])) });
+  }
+  return groups.filter((g) => g.items.length).map((g) => ({ ...g, items: g.items.sort(sortFn) }));
+}
+
+function listHTML() {
+  const list = filteredProjects();
+  const groups = groupProjects(list);
+  const active = state.projects.filter((p) => p.status !== 'done');
+  const inProg = active.filter((p) => p.status === 'in_progress').length;
+  const filtered = pv.room || pv.type || pv.prio || pv.status !== 'active';
+
+  return `
+    <div class="listhead">
+      <h1>Projects</h1>
+      <button class="btn primary sm" data-act="new-project">+ New project</button>
+    </div>
+    <p class="muted summary">${active.length} active${inProg ? ` · ${inProg} in progress` : ''} ·
+      <button class="link inline" data-act="go-settings">Rooms &amp; types</button></p>
+
+    <div class="seg" role="group" aria-label="Group by">
+      <span>Group by</span>
+      ${GROUPS.map((g) => `<button class="${pv.group === g.id ? 'active' : ''}" data-act="group" data-v="${g.id}">${g.label}</button>`).join('')}
+    </div>
+
+    <div class="filters">
+      <select data-filter="room" aria-label="Filter by room">
+        ${catOptions(state.rooms, pv.room, 'All rooms')}<option value="none" ${pv.room === 'none' ? 'selected' : ''}>No room</option>
+      </select>
+      <select data-filter="type" aria-label="Filter by type">
+        ${catOptions(state.ptypes, pv.type, 'All types')}<option value="none" ${pv.type === 'none' ? 'selected' : ''}>No type</option>
+      </select>
+      <select data-filter="status" aria-label="Filter by status">
+        <option value="active" ${pv.status === 'active' ? 'selected' : ''}>Active (not done)</option>
+        <option value="all" ${pv.status === 'all' ? 'selected' : ''}>All statuses</option>
+        ${enumOptions(STATUSES, pv.status)}
+      </select>
+      <select data-filter="prio" aria-label="Filter by priority">
+        <option value="">All priorities</option>${enumOptions(PRIORITIES, pv.prio)}
+      </select>
+    </div>
+    ${filtered ? `<button class="link clear" data-act="clear-filters">Clear filters</button>` : ''}
+
+    ${groups.map((g) => `
+      <section class="group">
+        <h3>${g.raw ? g.title : esc(g.title)} <span>· ${g.items.length}</span></h3>
+        <div class="pcards">${g.items.map(cardHTML).join('')}</div>
+      </section>`).join('')}
+
+    ${!list.length ? `<div class="empty">${state.projects.length
+      ? 'No projects match these filters.'
+      : 'No projects yet.<br><br><button class="btn primary" data-act="new-project">Create the first one</button>'}</div>` : ''}`;
+}
+
+function cardHTML(p) {
+  const st = projectStats(p);
+  const room = byId(state.rooms, p.room_id);
+  const type = byId(state.ptypes, p.type_id);
+  const meta = [
+    pv.group !== 'room' && room ? label(room) : '',
+    pv.group !== 'type' && type ? label(type) : '',
+    p.owner ? esc(personName(p.owner)) : '',
+    p.due_date ? `<span class="${p.due_date < today() && p.status !== 'done' ? 'overdue' : ''}">Target ${fmtDate(p.due_date)}</span>` : '',
+  ].filter(Boolean).join(' · ');
+  const bits = [
+    st.tasks.length ? `${st.done}/${st.tasks.length} tasks` : '',
+    st.links ? `🔗 ${st.links}` : '',
+    st.files ? `📎 ${st.files}` : '',
+    p.budget || st.spent ? `${kr(st.spent)}${p.budget ? ` of ${kr(p.budget)}` : ' spent'}` : '',
+  ].filter(Boolean);
+
+  return `
+    <a class="pcard ${p.status === 'done' ? 'is-done' : ''}" href="#projects/${p.id}">
+      <div class="ptop">
+        <span class="prio p-${p.priority}" title="${prioLabel(p.priority)} priority"></span>
+        <h4>${esc(p.title)}</h4>
+        ${pv.group !== 'status' ? `<span class="status st-${p.status}">${statusLabel(p.status)}</span>` : ''}
+      </div>
+      ${meta ? `<div class="pmeta">${meta}</div>` : ''}
+      ${st.next ? `<div class="pnext"><b>Next:</b> ${esc(st.next.text)}${st.next.due_date ? ` · ${fmtDate(st.next.due_date)}` : ''}</div>` : ''}
+      ${st.tasks.length ? progressBar(st.done, st.tasks.length) : ''}
+      ${bits.length ? `<div class="pfoot">${bits.join(' · ')}</div>` : ''}
+    </a>`;
+}
+
+// ----- Detail view -----
+function detailHTML(id) {
+  const p = byId(state.projects, id);
+  if (!p) {
+    return `<a class="back" href="#projects">← Projects</a>
+      <div class="empty">This project doesn't exist any more.</div>`;
+  }
+  const st = projectStats(p);
+  return `
+    <a class="back" href="#projects">← Projects</a>
+    <div class="listhead dhead">
+      <span class="prio p-${p.priority}"></span>
+      <h1 class="wrap-title">${esc(p.title)}</h1>
+      <button class="link" data-act="rename-project">Rename</button>
+    </div>
+
+    <section class="panel">
+      <div class="fields">
+        <label>Status<select data-field="status">${enumOptions(STATUSES, p.status)}</select></label>
+        <label>Priority<select data-field="priority">${enumOptions(PRIORITIES, p.priority)}</select></label>
+        <label>Room<select data-field="room_id">${catOptions(state.rooms, p.room_id, '—', '+ New room…')}</select></label>
+        <label>Type<select data-field="type_id">${catOptions(state.ptypes, p.type_id, '—', '+ New type…')}</select></label>
+        <label>Responsible<select data-field="owner">${peopleOptions(p.owner, '—')}</select></label>
+        <label>Target date<input type="date" data-field="due_date" value="${esc(p.due_date || '')}"></label>
+      </div>
+      <label class="full">Description
+        <textarea data-field="description" rows="3" placeholder="What's the goal? Measurements, wishes, constraints…">${esc(p.description || '')}</textarea>
+      </label>
+      ${st.tasks.length ? `<div class="progress-line">${progressBar(st.done, st.tasks.length)}<span>${st.done} of ${st.tasks.length} tasks done</span></div>` : ''}
+    </section>
+
+    ${tasksPanel(p, st)}
+    ${linksPanel(p)}
+    ${budgetPanel(p, st)}
+    ${filesPanel(p)}
+    ${notesPanel(p)}
+
+    <div class="danger-zone">
+      <button class="link danger" data-act="delete-project">Delete project</button>
+    </div>`;
+}
+
+function tasksPanel(p, st) {
+  const done = st.tasks.filter((t) => t.done).sort((a, b) => String(b.done_at).localeCompare(String(a.done_at)));
+  return `
+    <section class="panel">
+      <h2>Tasks &amp; next steps</h2>
+      <form class="addrow" data-form="task" autocomplete="off">
+        <input name="text" data-keep="task-text" placeholder="Add a task or next step…" maxlength="200" required aria-label="Task">
+        <select name="assignee" data-keep="task-who" aria-label="Who">${peopleOptions(null, 'Anyone')}</select>
+        <input name="due" type="date" data-keep="task-due" aria-label="Due date">
+        <button class="btn primary" type="submit">Add</button>
+      </form>
+      ${st.open.length ? `<ul class="items tasks">${st.open.map((t, i) => taskRow(t, i === 0)).join('')}</ul>`
+        : `<p class="muted small pad">${done.length ? 'All tasks done! 🎉' : 'No tasks yet.'}</p>`}
+      ${done.length ? `
+        <details data-key="done-${p.id}">
+          <summary>Done · ${done.length}</summary>
+          <ul class="items tasks">${done.map((t) => taskRow(t, false)).join('')}</ul>
+        </details>` : ''}
+    </section>`;
+}
+
+function taskRow(t, isNext) {
+  if (state.editTask === t.id) {
+    return `
+      <li class="item editing" data-id="${t.id}">
+        <form class="inline-edit" data-form="task-edit" data-id="${t.id}">
+          <input name="text" data-keep="et-text-${t.id}" value="${esc(t.text)}" maxlength="200" required aria-label="Task">
+          <select name="assignee" data-keep="et-who-${t.id}" aria-label="Who">${peopleOptions(t.assignee, 'Anyone')}</select>
+          <input name="due" type="date" data-keep="et-due-${t.id}" value="${esc(t.due_date || '')}" aria-label="Due date">
+          <div class="row-actions">
+            <button type="button" class="link danger" data-act="task-del">Delete</button>
+            <span></span>
+            <button type="button" class="btn sm" data-act="task-cancel">Cancel</button>
+            <button class="btn primary sm" type="submit">Save</button>
+          </div>
+        </form>
+      </li>`;
+  }
+  const overdue = !t.done && t.due_date && t.due_date < today();
+  const meta = t.done
+    ? `Done by ${esc(who(t.done_by))}${t.done_at ? ` · ${fmtDate(t.done_at.slice(0, 10))}` : ''}`
+    : [t.assignee ? esc(personName(t.assignee)) : '',
+       t.due_date ? `<span class="${overdue ? 'overdue' : ''}">${overdue ? 'Overdue · ' : 'Due '}${fmtDate(t.due_date)}</span>` : '']
+      .filter(Boolean).join(' · ');
+  return `
+    <li class="item ${t.done ? 'checked' : ''}" data-id="${t.id}">
+      <button class="check" data-act="task-toggle" aria-label="${t.done ? 'Mark as not done' : 'Mark as done'}">${TICK}</button>
+      <div class="body" data-act="task-edit" title="Edit">
+        <div class="name">${isNext ? '<span class="tag">Next</span>' : ''}${esc(t.text)}</div>
+        ${meta ? `<div class="meta">${meta}</div>` : ''}
+      </div>
+    </li>`;
+}
+
+function linksPanel(p) {
+  const links = state.plinks.filter((l) => l.project_id === p.id)
+    .sort((a, b) => (b.favorite - a.favorite) || a.created_at.localeCompare(b.created_at));
+  return `
+    <section class="panel">
+      <h2>Solutions &amp; links</h2>
+      <form class="linkform" data-form="link" autocomplete="off">
+        <input name="url" data-keep="link-url" placeholder="Paste a link…" inputmode="url" required aria-label="Link">
+        <input name="title" data-keep="link-title" placeholder="Name (optional)" maxlength="120" aria-label="Name">
+        <input name="price" data-keep="link-price" placeholder="Price kr" inputmode="decimal" aria-label="Price">
+        <input name="note" data-keep="link-note" placeholder="Note – pros, cons, size… (optional)" maxlength="300" aria-label="Note">
+        <button class="btn primary" type="submit">Add</button>
+      </form>
+      ${links.length ? `<ul class="links">${links.map(linkRow).join('')}</ul>`
+        : '<p class="muted small pad">Paste links to products, inspiration or suppliers you find.</p>'}
+    </section>`;
+}
+
+function linkRow(l) {
+  if (state.editLink === l.id) {
+    return `
+      <li class="link-card editing" data-id="${l.id}">
+        <form class="inline-edit" data-form="link-edit" data-id="${l.id}">
+          <input name="title" data-keep="el-title-${l.id}" value="${esc(l.title || '')}" placeholder="Name" maxlength="120" aria-label="Name">
+          <input name="url" data-keep="el-url-${l.id}" value="${esc(l.url)}" required aria-label="Link">
+          <input name="price" data-keep="el-price-${l.id}" value="${l.price ?? ''}" placeholder="Price kr" inputmode="decimal" aria-label="Price">
+          <input name="note" data-keep="el-note-${l.id}" value="${esc(l.note || '')}" placeholder="Note" maxlength="300" aria-label="Note">
+          <div class="row-actions">
+            <button type="button" class="link danger" data-act="link-del">Delete</button>
+            <span></span>
+            <button type="button" class="btn sm" data-act="link-cancel">Cancel</button>
+            <button class="btn primary sm" type="submit">Save</button>
+          </div>
+        </form>
+      </li>`;
+  }
+  const host = hostOf(l.url);
+  return `
+    <li class="link-card ${l.favorite ? 'fav' : ''}" data-id="${l.id}">
+      <img class="favicon" src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=64" alt="" loading="lazy">
+      <div class="body">
+        <a href="${safeHref(l.url)}" target="_blank" rel="noopener" class="ltitle">${esc(l.title || host || l.url)}</a>
+        <div class="meta">${esc(host)}${l.price !== null ? ` · <b>${kr(l.price)}</b>` : ''} · added by ${esc(who(l.created_by))}</div>
+        ${l.note ? `<div class="lnote">${richText(l.note)}</div>` : ''}
+      </div>
+      <div class="lactions">
+        <button class="icon ${l.favorite ? 'on' : ''}" data-act="link-fav" title="${l.favorite ? 'Remove from shortlist' : 'Shortlist'}" aria-label="Shortlist">★</button>
+        <button class="icon" data-act="link-edit" title="Edit" aria-label="Edit">✎</button>
+      </div>
+    </li>`;
+}
+
+function budgetPanel(p, st) {
+  const costs = state.pcosts.filter((c) => c.project_id === p.id);
+  const prices = state.plinks.filter((l) => l.project_id === p.id && l.price !== null).map((l) => Number(l.price));
+  const budget = p.budget !== null ? Number(p.budget) : null;
+  const over = budget !== null && st.spent > budget;
+  return `
+    <section class="panel">
+      <h2>Budget &amp; costs</h2>
+      <div class="budget-top">
+        <label>Budget
+          <input data-field="budget" inputmode="decimal" placeholder="e.g. 30 000" value="${budget !== null ? budget : ''}">
+        </label>
+        <div class="budget-sum">
+          <div><span class="muted">Spent</span><b>${kr(st.spent)}</b></div>
+          ${budget !== null ? `<div><span class="muted">${over ? 'Over by' : 'Left'}</span><b class="${over ? 'overdue' : ''}">${kr(Math.abs(budget - st.spent))}</b></div>` : ''}
+        </div>
+      </div>
+      ${budget ? progressBar(st.spent, budget, over) : ''}
+      ${prices.length ? `<p class="muted small">Prices on saved solutions: ${prices.length > 1
+        ? `${kr(Math.min(...prices))} – ${kr(Math.max(...prices))}` : kr(prices[0])}</p>` : ''}
+      ${costs.length ? `<ul class="costs">${costs.map((c) => `
+        <li data-id="${c.id}">
+          <div class="body"><div>${esc(c.description)}</div>
+            <div class="meta">${esc(who(c.created_by))} · ${fmtDate(c.created_at.slice(0, 10))}</div></div>
+          <b>${kr(c.amount)}</b>
+          <button class="del" data-act="cost-del" aria-label="Remove cost">×</button>
+        </li>`).join('')}</ul>` : ''}
+      <form class="addrow cost" data-form="cost" autocomplete="off">
+        <input name="description" data-keep="cost-desc" placeholder="What did we pay for?" maxlength="120" required aria-label="Cost description">
+        <input name="amount" data-keep="cost-amount" placeholder="Amount kr" inputmode="decimal" required aria-label="Amount">
+        <button class="btn" type="submit">Add cost</button>
+      </form>
+    </section>`;
+}
+
+function filesPanel(p) {
+  const files = state.pfiles.filter((f) => f.project_id === p.id);
+  const images = files.filter((f) => f.mime?.startsWith('image/'));
+  const docs = files.filter((f) => !f.mime?.startsWith('image/'));
+  const url = (path) => esc(signedCache.get(path)?.url || '');
+  return `
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Photos &amp; files</h2>
+        <label class="btn sm upload">+ Add<input type="file" multiple hidden data-act="upload"
+          accept="image/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx,.dwg,.txt"></label>
+      </div>
+      ${images.length ? `<div class="thumbs">${images.map((f) => `
+        <div class="thumb" data-id="${f.id}">
+          <a data-path="${esc(f.path)}" href="${url(f.path) || '#'}" target="_blank" rel="noopener" title="${esc(f.name)}">
+            <img data-path="${esc(f.path)}" ${url(f.path) ? `src="${url(f.path)}"` : ''} alt="${esc(f.name)}" loading="lazy">
+          </a>
+          <button class="x" data-act="file-del" aria-label="Delete ${esc(f.name)}">×</button>
+        </div>`).join('')}</div>` : ''}
+      ${docs.length ? `<ul class="files">${docs.map((f) => `
+        <li data-id="${f.id}">
+          <span class="ficon">${/pdf/i.test(f.mime || f.name) ? 'PDF' : 'FILE'}</span>
+          <div class="body">
+            <a data-path="${esc(f.path)}" href="${url(f.path) || '#'}" target="_blank" rel="noopener">${esc(f.name)}</a>
+            <div class="meta">${esc(who(f.created_by))} · ${fmtDate(f.created_at.slice(0, 10))}${f.size ? ` · ${(f.size / 1048576).toFixed(1)} MB` : ''}</div>
+          </div>
+          <button class="del" data-act="file-del" aria-label="Delete ${esc(f.name)}">×</button>
+        </li>`).join('')}</ul>` : ''}
+      ${!files.length ? '<p class="muted small pad">Drawings, quotes, inspiration photos, receipts…</p>' : ''}
+    </section>`;
+}
+
+function notesPanel(p) {
+  const notes = state.pnotes.filter((n) => n.project_id === p.id);
+  return `
+    <section class="panel">
+      <h2>Notes &amp; log</h2>
+      <form class="noteform" data-form="note">
+        <textarea name="body" data-keep="note-body" rows="2" placeholder="E.g. Called the wardrobe maker – revised drawing coming Friday" required></textarea>
+        <button class="btn primary" type="submit">Add note</button>
+      </form>
+      ${notes.length ? `<ul class="notes">${notes.map((n) => `
+        <li data-id="${n.id}">
+          <div class="meta">${esc(who(n.created_by))} · ${fmtWhen(n.created_at)}
+            <button class="link small" data-act="note-del">Delete</button></div>
+          <div class="nbody">${richText(n.body)}</div>
+        </li>`).join('')}</ul>` : ''}
+    </section>`;
+}
+
+// ----- Rooms & types settings -----
+function settingsHTML() {
+  const block = (title, kind, arr) => `
+    <section class="panel">
+      <h2>${title}</h2>
+      <ul class="items">${arr.map((x) => {
+        const n = state.projects.filter((p) => p[kind === 'room' ? 'room_id' : 'type_id'] === x.id).length;
+        return `
+        <li class="item" data-id="${x.id}" data-kind="${kind}">
+          <div class="body"><div class="name">${label(x)}</div><div class="meta">${n} project${n === 1 ? '' : 's'}</div></div>
+          <button class="link" data-act="cat-up" aria-label="Move up">↑</button>
+          <button class="link" data-act="cat-rename">Rename</button>
+          <button class="del" data-act="cat-del" aria-label="Delete">×</button>
+        </li>`;
+      }).join('')}</ul>
+      <button class="link addcat" data-act="cat-add" data-kind="${kind}">+ Add ${kind}</button>
+    </section>`;
+  return `
+    <a class="back" href="#projects">← Projects</a>
+    <div class="listhead"><h1>Rooms &amp; types</h1></div>
+    <p class="muted small">Tip: start a name with an emoji to give it an icon, e.g. “🛏️ Bedroom”.</p>
+    ${block('Rooms', 'room', state.rooms)}
+    ${block('Project types', 'type', state.ptypes)}`;
+}
+
+// ---------- Signed URLs for private files ----------
+const signedCache = new Map();
+async function fillSigned() {
+  const els = [...$('view').querySelectorAll('[data-path]')];
+  if (!els.length) return;
+  const now = Date.now();
+  const need = [...new Set(els.map((e) => e.dataset.path))].filter((p) => !(signedCache.get(p)?.exp > now + 60000));
+  if (need.length) {
+    const { data, error } = await sb.storage.from(BUCKET).createSignedUrls(need, 3600);
+    if (error) return console.warn(error);
+    for (const d of data) if (d.signedUrl) signedCache.set(d.path, { url: d.signedUrl, exp: now + 3600 * 1000 });
+  }
+  for (const el of $('view').querySelectorAll('[data-path]')) {
+    const s = signedCache.get(el.dataset.path);
+    if (!s) continue;
+    if (el.tagName === 'IMG') { if (el.src !== s.url) el.src = s.url; } else el.href = s.url;
+  }
+}
+
+// Phone photos are big – shrink large JPEGs before upload to save storage
+async function shrinkImage(file) {
+  if (file.type !== 'image/jpeg' || file.size < 1.5 * 1048576 || !window.createImageBitmap) return file;
+  try {
+    const bmp = await createImageBitmap(file);
+    const scale = Math.min(1, 2400 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * scale);
+    c.height = Math.round(bmp.height * scale);
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.85));
+    return blob && blob.size < file.size ? blob : file;
+  } catch { return file; }
+}
+
+async function uploadFiles(projectId, files) {
+  if (!files.length) return;
+  toast(`Uploading ${files.length} file${files.length > 1 ? 's' : ''}…`);
+  let ok = 0;
+  for (const f of files) {
+    const blob = await shrinkImage(f);
+    const safe = f.name.normalize('NFKD').replace(/[^\w.-]+/g, '_').slice(-80) || 'file';
+    const path = `${projectId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safe}`;
+    const type = blob.type || f.type || 'application/octet-stream';
+    const { error } = await sb.storage.from(BUCKET).upload(path, blob, { contentType: type });
+    if (error) { toast(`${f.name}: ${error.message}`); continue; }
+    const row = await dbInsert('project_files', { project_id: projectId, path, name: f.name, mime: type, size: blob.size, created_by: uid() });
+    if (row) ok++;
+  }
+  if (ok) toast(`Uploaded ${ok} file${ok > 1 ? 's' : ''}`);
+}
+
+// ---------- Actions ----------
+const currentProject = () => {
+  const { section, sub } = parseRoute();
+  return section === 'projects' && sub ? byId(state.projects, sub) : null;
+};
+
+async function newProject() {
+  const title = await ask('New project', '', 'Create');
+  if (!title) return;
+  const p = await dbInsert('projects', {
+    title,
+    status: 'idea',
+    priority: 'medium',
+    room_id: pv.room && pv.room !== 'none' ? pv.room : null,
+    type_id: pv.type && pv.type !== 'none' ? pv.type : null,
+    created_by: uid(),
+  });
+  if (p) location.hash = `projects/${p.id}`;
+}
+
+async function addCategory(kind) {
+  const [table, arr] = kind === 'room' ? ['rooms', state.rooms] : ['project_types', state.ptypes];
+  const text = await ask(kind === 'room' ? 'New room' : 'New project type', '', 'Add');
+  if (!text) return null;
+  return dbInsert(table, { ...splitEmoji(text), position: nextPos(arr) });
+}
+
+async function onProjectsClick(e) {
+  const el = e.target.closest('[data-act]');
+  if (!el) return;
+  const act = el.dataset.act;
+  if (act === 'upload') return; // the file input handles itself
+  const p = currentProject();
+  const rowId = el.closest('[data-id]')?.dataset.id;
+
+  switch (act) {
+    case 'new-project': return newProject();
+    case 'go-settings': location.hash = 'projects/settings'; return;
+    case 'group':
+      pv.group = el.dataset.v; store('pGroup', pv.group); return renderView();
+    case 'clear-filters':
+      Object.assign(pv, { room: '', type: '', prio: '', status: 'active' }); store('pStatus', 'active'); return renderView();
+
+    case 'rename-project': {
+      const title = await ask('Rename project', p.title);
+      if (title && title !== p.title) dbUpdate('projects', p.id, { title });
+      return;
+    }
+    case 'delete-project': {
+      if (!confirm(`Delete "${p.title}" with all its tasks, links, notes and files?`)) return;
+      const paths = state.pfiles.filter((f) => f.project_id === p.id).map((f) => f.path);
+      if (paths.length) await sb.storage.from(BUCKET).remove(paths);
+      location.hash = 'projects';
+      return dbDelete('projects', p.id);
+    }
+
+    // Tasks
+    case 'task-toggle': {
+      const t = byId(state.ptasks, rowId);
+      if (!t) return;
+      const done = !t.done;
+      return dbUpdate('project_tasks', t.id, { done, done_by: done ? uid() : null, done_at: done ? new Date().toISOString() : null });
+    }
+    case 'task-edit': state.editTask = rowId; state.editLink = null; renderView();
+      $('view').querySelector(`[data-keep="et-text-${rowId}"]`)?.focus(); return;
+    case 'task-cancel': state.editTask = null; return renderView();
+    case 'task-del': state.editTask = null; return dbDelete('project_tasks', rowId);
+
+    // Links
+    case 'link-fav': {
+      const l = byId(state.plinks, rowId);
+      return l && dbUpdate('project_links', l.id, { favorite: !l.favorite });
+    }
+    case 'link-edit': state.editLink = rowId; state.editTask = null; return renderView();
+    case 'link-cancel': state.editLink = null; return renderView();
+    case 'link-del': state.editLink = null; return dbDelete('project_links', rowId);
+
+    // Costs, notes, files
+    case 'cost-del': return dbDelete('project_costs', rowId);
+    case 'note-del':
+      if (confirm('Delete this note?')) dbDelete('project_notes', rowId);
+      return;
+    case 'file-del': {
+      const f = byId(state.pfiles, rowId);
+      if (!f || !confirm(`Delete "${f.name}"?`)) return;
+      const { error } = await sb.storage.from(BUCKET).remove([f.path]);
+      if (error) return toast(error.message);
+      return dbDelete('project_files', f.id);
+    }
+
+    // Rooms & types
+    case 'cat-add': return addCategory(el.dataset.kind);
+    case 'cat-rename':
+    case 'cat-del':
+    case 'cat-up': {
+      const kind = el.closest('[data-kind]').dataset.kind;
+      const [table, key, field] = kind === 'room' ? ['rooms', 'rooms', 'room_id'] : ['project_types', 'ptypes', 'type_id'];
+      const x = byId(state[key], rowId);
+      if (!x) return;
+      if (act === 'cat-rename') {
+        const text = await ask(`Rename ${kind}`, `${x.emoji ? x.emoji + ' ' : ''}${x.name}`);
+        if (text) dbUpdate(table, x.id, splitEmoji(text));
+      } else if (act === 'cat-del') {
+        const n = state.projects.filter((pr) => pr[field] === x.id).length;
+        if (!confirm(`Delete "${x.name}"?${n ? ` ${n} project${n > 1 ? 's' : ''} will have no ${kind}.` : ''}`)) return;
+        state.projects.forEach((pr) => { if (pr[field] === x.id) pr[field] = null; });
+        dbDelete(table, x.id);
+      } else {
+        // Move up: renumber the whole list so positions are unique
+        const arr = [...state[key]];
+        const i = arr.indexOf(x);
+        if (i <= 0) return;
+        [arr[i - 1], arr[i]] = [arr[i], arr[i - 1]];
+        arr.forEach((item, idx) => { item.position = idx; });
+        state[key] = arr;
+        renderView();
+        const results = await Promise.all(arr.map((item) => sb.from(table).update({ position: item.position }).eq('id', item.id)));
+        const err = results.find((r) => r.error)?.error;
+        if (err) { toast(err.message); refresh(); }
+      }
+    }
+  }
+}
+
+async function onProjectsChange(e) {
+  const el = e.target;
+
+  if (el.dataset.filter) {
+    pv[el.dataset.filter] = el.value;
+    if (el.dataset.filter === 'status') store('pStatus', el.value);
+    return renderView();
+  }
+
+  if (el.type === 'file' && el.dataset.act === 'upload') {
+    const p = currentProject();
+    const files = [...el.files];
+    el.value = '';
+    if (p) uploadFiles(p.id, files);
+    return;
+  }
+
+  const field = el.dataset.field;
+  const p = currentProject();
+  if (!field || !p) return;
+  let value = el.value;
+
+  if ((field === 'room_id' || field === 'type_id') && value === '__new') {
+    const created = await addCategory(field === 'room_id' ? 'room' : 'type');
+    if (!created) return renderView();
+    value = created.id;
+  }
+  if (field === 'budget') {
+    value = parseAmount(value);
+    if (Number.isNaN(value)) { toast('Budget must be a number'); return renderView(); }
+  }
+  if (field === 'description') value = value.trim() || null;
+  if (value === '') value = null;
+  if (p[field] === value) return;
+  dbUpdate('projects', p.id, { [field]: value });
+}
+
+async function onProjectsSubmit(e) {
+  const form = e.target.closest('form[data-form]');
+  if (!form) return;
+  e.preventDefault();
+  const p = currentProject();
+  if (!p) return;
+  const f = Object.fromEntries(new FormData(form));
+  const clear = () => form.querySelectorAll('[data-keep]').forEach((x) => { x.value = ''; });
+
+  switch (form.dataset.form) {
+    case 'task': {
+      const text = f.text.trim();
+      if (!text) return;
+      clear();
+      await dbInsert('project_tasks', { project_id: p.id, text, assignee: f.assignee || null, due_date: f.due || null, created_by: uid() });
+      $('view').querySelector('[data-keep="task-text"]')?.focus();
+      return;
+    }
+    case 'task-edit': {
+      const text = f.text.trim();
+      if (!text) return;
+      state.editTask = null;
+      return dbUpdate('project_tasks', form.dataset.id, { text, assignee: f.assignee || null, due_date: f.due || null });
+    }
+    case 'link':
+    case 'link-edit': {
+      const url = normalizeUrl(f.url);
+      const price = parseAmount(f.price);
+      if (!hostOf(url)) return toast("That doesn't look like a link");
+      if (Number.isNaN(price)) return toast('Price must be a number');
+      const row = { url, title: f.title.trim() || null, price, note: f.note.trim() || null };
+      if (form.dataset.form === 'link') {
+        clear();
+        return dbInsert('project_links', { ...row, project_id: p.id, created_by: uid() });
+      }
+      state.editLink = null;
+      return dbUpdate('project_links', form.dataset.id, row);
+    }
+    case 'cost': {
+      const amount = parseAmount(f.amount);
+      if (amount === null || Number.isNaN(amount)) return toast('Amount must be a number');
+      clear();
+      return dbInsert('project_costs', { project_id: p.id, description: f.description.trim(), amount, created_by: uid() });
+    }
+    case 'note': {
+      const body = f.body.trim();
+      if (!body) return;
+      clear();
+      return dbInsert('project_notes', { project_id: p.id, body, created_by: uid() });
+    }
+  }
+}
+
+// Ctrl/Cmd+Enter adds a note
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && e.target.matches?.('[data-keep="note-body"]')) {
+    e.target.form.requestSubmit();
+  }
+});
 
 init();

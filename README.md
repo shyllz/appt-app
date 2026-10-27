@@ -4,14 +4,15 @@ A shared web app for organizing the apartment. Built section by section.
 
 **Sections**
 - ✅ Shopping lists: several lists, categories, check off, see who added what, live sync
-- ⏳ More to come (projects, …)
+- ✅ Projects: by room, type, priority and status; tasks & next steps, links to solutions, budget & costs, photos & files, notes
+- ⏳ More to come
 
 ## How it works
 - Plain HTML/CSS/JavaScript, no build step. Hosted on GitHub Pages.
 - Data and logins in Supabase. Only users created in Supabase can sign in.
 
 ## Setup (one time)
-1. **Database:** Supabase → SQL Editor → paste `supabase/01_shopping.sql` → Run.
+1. **Database:** Supabase → SQL Editor → paste `supabase/01_shopping.sql` → Run. Then do the same with `supabase/02_projects.sql`.
 2. **Turn off public sign-ups:** Supabase → Authentication → Sign In / Providers → turn off *Allow new users to sign up* → Save.
 3. **Create the two users:** Authentication → Users → Add user → Create new user (email + password, tick *Auto Confirm User*).
 4. **Publish:** GitHub repo → Settings → Pages → Deploy from a branch → `main` / `(root)` → Save.
