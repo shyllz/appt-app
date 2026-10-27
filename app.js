@@ -118,9 +118,27 @@ async function init() {
     if (session?.user?.id !== before) setTimeout(route, 0);
   });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && state.screen === 'main') refresh();
+    if (document.visibilityState !== 'visible') return;
+    checkForUpdate();
+    if (state.screen === 'main') refresh();
   });
+  checkForUpdate();
   route();
+}
+
+// Home-screen apps (iPhone/Android) keep old files cached. Compare the version
+// in the live index.html with the one we're running; if newer, load it fresh.
+async function checkForUpdate() {
+  try {
+    const running = document.querySelector('meta[name="app-version"]')?.content;
+    const res = await fetch('./index.html?check=' + Date.now(), { cache: 'no-store' });
+    if (!res.ok) return;
+    const live = (await res.text()).match(/name="app-version" content="([^"]+)"/)?.[1];
+    if (!live || live === running) return;
+    if (sessionStorage.getItem('updatedTo') === live) return; // avoid reload loops
+    sessionStorage.setItem('updatedTo', live);
+    location.replace('./?v=' + encodeURIComponent(live) + location.hash);
+  } catch { /* offline – ignore */ }
 }
 
 async function route() {

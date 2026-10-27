@@ -17,3 +17,6 @@ A shared web app for organizing the apartment. Built section by section.
 3. **Create the two users:** Authentication → Users → Add user → Create new user (email + password, tick *Auto Confirm User*).
 4. **Publish:** GitHub repo → Settings → Pages → Deploy from a branch → `main` / `(root)` → Save.
 5. Open `https://<username>.github.io/apartment-app/` and sign in. On a phone: Share → *Add to Home Screen*.
+
+## Publishing updates
+When you upload changed files to GitHub, open `index.html` and bump the version number in **all three places** (`app-version`, `style.css?v=`, `app.js?v=`), e.g. 2 → 3, and upload it too. The home-screen app checks this number each time it's opened and reloads itself when it changes.
