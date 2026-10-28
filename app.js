@@ -31,6 +31,7 @@ const SECTIONS = [
   { id: 'home', label: 'Home' },
   { id: 'shopping', label: 'Shopping' },
   { id: 'projects', label: 'Projects' },
+  { id: 'ideas', label: 'Ideas', icon: '💡' }, // icon only on narrow phones
 ];
 
 // ---------- State ----------
@@ -62,6 +63,11 @@ const state = {
   homeError: '',
   household: null,   // { photo_path, photo_by, photo_at }
   photoBusy: false,
+  // Ideas (suggestion box)
+  ideasReady: false,
+  ideasError: '',
+  ideas: [],
+  editIdea: null,
 };
 
 const app = document.getElementById('app');
@@ -188,7 +194,7 @@ async function loadAll() {
   if (!state.lists.some((x) => x.id === state.currentListId)) {
     setCurrent(state.lists[0]?.id ?? null);
   }
-  await Promise.all([loadProjects(), loadHome()]);
+  await Promise.all([loadProjects(), loadHome(), loadIdeas()]);
   return true;
 }
 
@@ -284,7 +290,7 @@ function renderMain() {
     <header class="top">
       <a class="brand" href="#home" aria-label="Home">${ICON}</a>
       <nav class="sections" id="nav">
-        ${SECTIONS.map((s) => `<button data-section="${s.id}">${esc(s.label)}</button>`).join('')}
+        ${SECTIONS.map((s) => `<button data-section="${s.id}" aria-label="${esc(s.label)}">${s.icon ? `<span class="ico">${s.icon}</span><span class="lbl">${esc(s.label)}</span>` : esc(s.label)}</button>`).join('')}
       </nav>
       <div class="me"><span class="nm">${esc(me?.display_name)} ·</span> <button class="link" id="signout">Sign out</button></div>
     </header>
@@ -298,7 +304,7 @@ function renderMain() {
   renderView();
 }
 
-// Hash routes: #home, #shopping, #projects, #projects/<id>, #projects/settings
+// Hash routes: #home, #shopping, #projects, #projects/<id>, #projects/settings, #ideas
 // Opening the app without a hash lands on the front page.
 function parseRoute() {
   const [sec, sub] = location.hash.replace(/^#\/?/, '').split('/');
@@ -321,6 +327,9 @@ function renderView() {
   } else if (r.section === 'shopping') {
     if (state.view !== 'shopping') buildShopping();
     renderShopping();
+  } else if (r.section === 'ideas') {
+    if (changed) state.editIdea = null;
+    renderIdeas(!changed);
   } else {
     if (changed) { state.editTask = null; state.editLink = null; }
     renderProjects(r.sub, !changed);
@@ -1742,6 +1751,223 @@ function onHomeChange(e) {
     setHomePhoto(file);
   }
 }
+
+// ============================================================
+// ---------- Ideas (suggestion box for the app itself) ----------
+// ============================================================
+const IDEA_STATUSES = [
+  { id: 'new', label: 'New' },
+  { id: 'planned', label: 'Planned' },
+  { id: 'done', label: 'Done' },
+  { id: 'declined', label: 'Not now' },
+];
+const IDEA_FILTERS = [
+  { id: 'open', label: 'Open' },
+  { id: 'done', label: 'Done' },
+  { id: 'declined', label: 'Not now' },
+  { id: 'all', label: 'All' },
+];
+const IDEA_RANK = { planned: 0, new: 1, done: 2, declined: 3 };
+const ideaStatusLabel = (id) => IDEA_STATUSES.find((s) => s.id === id)?.label || id;
+const iv = { filter: store('ideasFilter') || 'open' };
+
+async function loadIdeas() {
+  const { data, error } = await sb.from('suggestions').select('*').order('created_at', { ascending: false });
+  if (error) {
+    console.warn('Ideas not available:', error);
+    state.ideasReady = false;
+    state.ideasError = error.message;
+    return;
+  }
+  state.ideasReady = true;
+  state.ideas = data;
+}
+
+// Reuse the projects helpers for optimistic writes
+TABLES.suggestions = 'ideas';
+
+function renderIdeas(keep) {
+  const view = $('view');
+  if (state.view !== 'ideas') {
+    state.view = 'ideas';
+    view.onclick = onIdeasClick;
+    view.onchange = onIdeasChange;
+    view.onsubmit = onIdeasSubmit;
+    keep = false;
+  }
+  const draw = () => { view.innerHTML = state.ideasReady ? ideasHTML() : ideasSetupHTML(); };
+  if (keep) keepWhileRendering(view, draw); else draw();
+}
+
+function ideasSetupHTML() {
+  return `
+    <div class="panel setup">
+      <h1>Ideas</h1>
+      <p>The suggestion box needs its database table first.</p>
+      <ol>
+        <li>Open Supabase → <b>SQL Editor</b>.</li>
+        <li>Paste the contents of <code>supabase/04_suggestions.sql</code> and press <b>Run</b>.</li>
+        <li>Come back here and reload the page.</li>
+      </ol>
+      <p class="muted small">Details: ${esc(state.ideasError)}</p>
+    </div>`;
+}
+
+function filteredIdeas() {
+  const f = iv.filter;
+  return state.ideas
+    .filter((x) => f === 'all' || (f === 'open' ? (x.status === 'new' || x.status === 'planned') : x.status === f))
+    .sort((a, b) => IDEA_RANK[a.status] - IDEA_RANK[b.status]
+      || (b.likes?.length || 0) - (a.likes?.length || 0)
+      || b.created_at.localeCompare(a.created_at));
+}
+
+function ideasHTML() {
+  const list = filteredIdeas();
+  const count = (fn) => state.ideas.filter(fn).length;
+  const counts = {
+    open: count((x) => x.status === 'new' || x.status === 'planned'),
+    done: count((x) => x.status === 'done'),
+    declined: count((x) => x.status === 'declined'),
+    all: state.ideas.length,
+  };
+  const openN = counts.open;
+  return `
+    <div class="listhead">
+      <h1>Ideas</h1>
+      ${openN ? `<button class="btn sm" data-act="idea-copy" title="Copy the open ideas as a list">Copy list</button>` : ''}
+    </div>
+    <p class="muted summary">Suggestions for new features or things to improve in the app.</p>
+
+    <form class="panel ideaform" data-form="idea" autocomplete="off">
+      <input name="title" data-keep="idea-title" placeholder="I wish the app could…" maxlength="120" required aria-label="Suggestion">
+      <textarea name="details" data-keep="idea-details" rows="2" maxlength="1000" placeholder="Details (optional) – why, how, examples…" aria-label="Details"></textarea>
+      <button class="btn primary" type="submit">Add suggestion</button>
+    </form>
+
+    <div class="seg" role="group" aria-label="Show">
+      ${IDEA_FILTERS.map((f) => `<button class="${iv.filter === f.id ? 'active' : ''}" data-act="idea-filter" data-v="${f.id}">${f.label}${counts[f.id] ? ` · ${counts[f.id]}` : ''}</button>`).join('')}
+    </div>
+
+    ${list.length ? `<div class="ideas">${list.map(ideaCard).join('')}</div>`
+      : `<div class="empty">${state.ideas.length ? 'Nothing here.' : 'No suggestions yet – add the first one above 💡'}</div>`}`;
+}
+
+function ideaCard(x) {
+  if (state.editIdea === x.id) {
+    return `
+      <div class="idea editing" data-id="${x.id}">
+        <form class="ideaform" data-form="idea-edit" data-id="${x.id}">
+          <input name="title" data-keep="ei-title-${x.id}" value="${esc(x.title)}" maxlength="120" required aria-label="Suggestion">
+          <textarea name="details" data-keep="ei-details-${x.id}" rows="3" maxlength="1000" placeholder="Details (optional)" aria-label="Details">${esc(x.details || '')}</textarea>
+          <div class="row-actions">
+            <button type="button" class="link danger" data-act="idea-del">Delete</button>
+            <span></span>
+            <button type="button" class="btn sm" data-act="idea-cancel">Cancel</button>
+            <button class="btn primary sm" type="submit">Save</button>
+          </div>
+        </form>
+      </div>`;
+  }
+  const likes = x.likes || [];
+  const liked = likes.includes(uid());
+  const likers = likes.map((id) => (id === uid() ? 'you' : personName(id))).join(' & ');
+  const closed = x.status === 'done' || x.status === 'declined';
+  return `
+    <div class="idea ${closed ? 'is-closed' : ''}" data-id="${x.id}">
+      <div class="idea-top">
+        <h4>${esc(x.title)}</h4>
+        <select class="idea-status is-${x.status}" data-act="idea-status" aria-label="Status">${enumOptions(IDEA_STATUSES, x.status)}</select>
+      </div>
+      ${x.details ? `<div class="idea-details">${richText(x.details)}</div>` : ''}
+      <div class="idea-foot">
+        <button class="like ${liked ? 'on' : ''}" data-act="idea-like" aria-pressed="${liked}" title="${likers ? `Liked by ${esc(likers)}` : 'I want this too'}">👍${likes.length ? ` ${likes.length}` : ''}</button>
+        <span class="meta">${esc(personName(x.created_by) || 'someone')} · ${fmtDate(x.created_at.slice(0, 10))}${x.status === 'done' && x.done_at ? ` · done ${fmtDate(x.done_at.slice(0, 10))}` : ''}</span>
+        <button class="icon" data-act="idea-edit" title="Edit" aria-label="Edit">✎</button>
+      </div>
+    </div>`;
+}
+
+async function copyIdeas() {
+  const open = state.ideas
+    .filter((x) => x.status === 'new' || x.status === 'planned')
+    .sort((a, b) => IDEA_RANK[a.status] - IDEA_RANK[b.status] || (b.likes?.length || 0) - (a.likes?.length || 0));
+  const text = 'Suggestions for the apartment app:\n\n' + open.map((x) =>
+    `- ${x.title}${x.status === 'planned' ? ' (planned)' : ''}${x.likes?.length ? ` (👍 ${x.likes.length})` : ''}` +
+    `${x.details ? '\n  ' + x.details.replace(/\n/g, '\n  ') : ''}`).join('\n');
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`Copied ${plural(open.length, 'idea')}`);
+  } catch {
+    toast("Couldn't copy on this device");
+  }
+}
+
+async function onIdeasClick(e) {
+  const el = e.target.closest('[data-act]');
+  if (!el) return;
+  const act = el.dataset.act;
+  const id = el.closest('[data-id]')?.dataset.id;
+  const x = id && byId(state.ideas, id);
+
+  switch (act) {
+    case 'idea-filter':
+      iv.filter = el.dataset.v; store('ideasFilter', iv.filter); return renderView();
+    case 'idea-copy': return copyIdeas();
+    case 'idea-like': {
+      if (!x) return;
+      const likes = x.likes || [];
+      const next = likes.includes(uid()) ? likes.filter((u) => u !== uid()) : [...likes, uid()];
+      return dbUpdate('suggestions', x.id, { likes: next });
+    }
+    case 'idea-edit':
+      state.editIdea = id; renderView();
+      $('view').querySelector(`[data-keep="ei-title-${id}"]`)?.focus();
+      return;
+    case 'idea-cancel': state.editIdea = null; return renderView();
+    case 'idea-del':
+      if (!x || !confirm(`Delete the suggestion "${x.title}"?`)) return;
+      state.editIdea = null;
+      return dbDelete('suggestions', x.id);
+  }
+}
+
+function onIdeasChange(e) {
+  const el = e.target;
+  if (el.dataset.act !== 'idea-status') return;
+  const x = byId(state.ideas, el.closest('[data-id]')?.dataset.id);
+  if (!x || x.status === el.value) return;
+  const status = el.value;
+  dbUpdate('suggestions', x.id, { status, done_at: status === 'done' ? new Date().toISOString() : null });
+  if (status === 'done') toast('Marked as done ✓');
+}
+
+async function onIdeasSubmit(e) {
+  const form = e.target.closest('form[data-form]');
+  if (!form) return;
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(form));
+  const title = f.title.trim();
+  if (!title) return;
+  const details = f.details.trim() || null;
+  if (form.dataset.form === 'idea') {
+    form.querySelectorAll('[data-keep]').forEach((el) => { el.value = ''; });
+    // Make sure the new idea is visible
+    if (iv.filter !== 'open' && iv.filter !== 'all') { iv.filter = 'open'; store('ideasFilter', 'open'); }
+    const row = await dbInsert('suggestions', { title, details, created_by: uid() });
+    if (row) toast('Thanks! Suggestion added 💡');
+    return;
+  }
+  state.editIdea = null;
+  return dbUpdate('suggestions', form.dataset.id, { title, details });
+}
+
+// Ctrl/Cmd+Enter in the details box adds the suggestion
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && e.target.matches?.('[data-keep="idea-details"]')) {
+    e.target.form.requestSubmit();
+  }
+});
 
 // Keyboard: Enter on the summary cards
 document.addEventListener('keydown', (e) => {

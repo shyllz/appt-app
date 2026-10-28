@@ -95,6 +95,15 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
   color: var(--muted); font-weight: 600; font-size: 14px; white-space: nowrap;
 }
 .sections button.active { background: var(--accent-soft); color: var(--accent); }
+.sections .ico { display: none; }
+@media (max-width: 480px) {
+  .sections .ico { display: inline; }
+  .sections .lbl { display: none; }
+  .top { gap: 6px; padding-left: 12px; padding-right: 8px; }
+  .sections { margin-left: 2px; gap: 2px; }
+  .sections button { padding: 6px 7px; }
+  .me .link { padding: 6px 4px; font-size: 13px; }
+}
 .me { margin-left: auto; display: flex; align-items: center; gap: 4px; font-size: 14px; color: var(--muted); white-space: nowrap; }
 
 .wrap { max-width: 640px; margin: 0 auto; padding: 16px 16px calc(40px + env(safe-area-inset-bottom)); }
@@ -453,3 +462,33 @@ button.hero-btn { width: 34px; padding: 0; justify-content: center; font-size: 2
 .todo-list .name { font-weight: 550; overflow-wrap: anywhere; }
 .todo-list .meta { font-size: 12.5px; color: var(--muted); margin-top: 1px; }
 .todo-card details summary { margin: 6px 0 0; text-transform: none; letter-spacing: 0; font-weight: 600; }
+
+/* ============ Ideas (suggestion box) ============ */
+.ideaform { display: grid; gap: 8px; }
+.panel.ideaform { margin: 0 0 14px; }
+.ideaform input, .ideaform textarea { padding: 9px 11px; }
+@media (min-width: 560px) { .panel.ideaform .btn { justify-self: end; } }
+.ideas { display: grid; gap: 8px; }
+.idea {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 12px 14px; box-shadow: var(--shadow);
+}
+.idea.is-closed { opacity: .65; }
+.idea.is-closed h4 { color: var(--muted); }
+.idea-top { display: flex; align-items: flex-start; gap: 10px; }
+.idea-top h4 { margin: 2px 0 0; font-size: 16.5px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.idea-status {
+  flex: none; width: auto; padding: 3px 8px; border-radius: 999px; font-size: 12.5px; font-weight: 650;
+  background: var(--surface-2); color: var(--muted); border-color: transparent; cursor: pointer;
+}
+.idea-status.is-planned { color: var(--info); background: color-mix(in srgb, var(--info) 14%, transparent); }
+.idea-status.is-done { color: var(--accent); background: var(--accent-soft); }
+.idea-details { font-size: 14.5px; margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.idea-foot { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.idea-foot .meta { flex: 1; min-width: 0; font-size: 12.5px; color: var(--muted); }
+.like {
+  flex: none; border: 1px solid var(--line); background: var(--surface); border-radius: 999px;
+  padding: 3px 10px; font-size: 13.5px; font-weight: 650; color: var(--muted);
+}
+.like:hover { border-color: var(--accent); }
+.like.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
