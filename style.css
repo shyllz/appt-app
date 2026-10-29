@@ -223,6 +223,20 @@ dialog h2 { margin: 0 0 12px; font-size: 18px; }
   font-size: 14px; transition: .2s; max-width: calc(100vw - 32px);
 }
 #toast.show { opacity: 1; transform: translateX(-50%); }
+#toast.show.tappable { pointer-events: auto; cursor: pointer; }
+
+/* New items from the other person */
+.badge {
+  display: inline-block; min-width: 18px; height: 18px; padding: 0 5px; margin-left: 5px;
+  border-radius: 999px; background: var(--danger); color: var(--surface);
+  font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; vertical-align: 1px;
+}
+.badge[hidden] { display: none; }
+.chip .newdot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); }
+.chip.active .newdot { box-shadow: 0 0 0 2px var(--accent-ink); }
+.item.is-new { background: var(--accent-soft); }
+.tag.new { background: var(--danger); color: var(--surface); }
+.stat-new { margin-top: 6px; font-size: 13px; font-weight: 650; color: var(--danger); }
 
 /* ============ Projects ============ */
 .small { font-size: 13px; }

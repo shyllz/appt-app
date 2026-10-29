@@ -4,7 +4,7 @@ A shared web app for organizing the apartment. Built section by section.
 
 **Sections**
 - ✅ Home: front page with a shared photo, shopping & project counts, and everyone's to-dos
-- ✅ Shopping lists: several lists, categories (incl. your own and one-time ones), move items between lists, check off, see who added what, live sync
+- ✅ Shopping lists: several lists, categories (incl. your own and one-time ones), move items between lists, check off, see who added what, live sync, and a heads-up when the other person adds something (pop-up, red number on the Shopping tab, *New* tags)
 - ✅ Projects: by room, type, priority and status; tasks & next steps, links to solutions, budget & costs, photos & files, notes
 - ✅ Ideas: a suggestion box for new features – status (new / planned / done / not now), 👍 to agree, copy the open ones as a list
 - ⏳ More to come

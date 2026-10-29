@@ -48,6 +48,9 @@ const state = {
   onceCat: null,     // one-time category picked in the add form (this session only)
   showCats: false,   // "Categories" panel open
   channel: null,
+  knownItemIds: null, // item ids we've already loaded – to spot new ones (null = first load)
+  pendingNew: [],     // new items from the other person, waiting to be announced
+  newSince: null,     // "last seen" at the start of this shopping visit – newer items get a New tag
   view: null,        // which section's markup is currently in #view
   route: null,       // last rendered hash route
   // Projects section
@@ -97,12 +100,14 @@ function who(userId) {
 }
 
 let toastTimer;
-function toast(msg) {
+function toast(msg, onTap) {
   const t = $('toast');
   t.textContent = msg;
   t.classList.add('show');
+  t.classList.toggle('tappable', !!onTap);
+  t.onclick = onTap ? () => { t.classList.remove('show'); onTap(); } : null;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 3000);
+  toastTimer = setTimeout(() => t.classList.remove('show'), onTap ? 6000 : 3000);
 }
 
 // Small text-input dialog. Resolves to the text, or null if cancelled.
@@ -161,6 +166,9 @@ async function checkForUpdate() {
 async function route() {
   if (!state.session) {
     unsubscribe();
+    state.knownItemIds = null;
+    state.pendingNew = [];
+    state.newSince = null;
     return renderLogin();
   }
   state.screen = 'loading';
@@ -196,6 +204,11 @@ async function loadAll() {
   state.profiles = Object.fromEntries(p.data.map((x) => [x.id, x]));
   state.lists = l.data;
   state.items = i.data;
+  // Items that appeared since the last load, added by someone else
+  if (state.knownItemIds) {
+    state.pendingNew.push(...i.data.filter((x) => !state.knownItemIds.has(x.id) && !x.checked && isFromOther(x)));
+  }
+  state.knownItemIds = new Set(i.data.map((x) => x.id));
   if (!state.lists.some((x) => x.id === state.currentListId)) {
     setCurrent(state.lists[0]?.id ?? null);
   }
@@ -231,6 +244,70 @@ function scheduleRefresh() {
 async function refresh() {
   if (state.screen !== 'main') return;
   if (await loadAll()) renderView();
+  announceNew();
+}
+
+// ---------- New items from the other person ----------
+// "Last seen" is remembered per person on each phone: the newest item
+// (by server time) that was on screen while the shopping list was open.
+const seenKey = () => 'shopSeen:' + uid();
+const latestCreated = () => state.items.reduce((m, i) => (i.created_at > m ? i.created_at : m), '');
+const isFromOther = (i) => !!i.added_by && i.added_by !== uid();
+
+function shopSeen() {
+  let s = store(seenKey());
+  if (s === null) { s = latestCreated(); store(seenKey(), s); } // first time on this phone: start fresh
+  return s;
+}
+
+function markShopSeen() {
+  if (document.visibilityState !== 'visible') return;
+  const latest = latestCreated();
+  if (latest > (store(seenKey()) || '')) store(seenKey(), latest);
+}
+
+// Still-to-buy items someone else added after `since`
+function unseenItems(since = shopSeen()) {
+  return state.items.filter((i) => !i.checked && isFromOther(i) && i.created_at > since);
+}
+
+function names(list) {
+  return list.length < 2 ? list.join('') : `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
+}
+
+// "Birkyboy added 3 new items" – grouped by who added them
+function newSummary(items) {
+  const by = {};
+  for (const i of items) (by[who(i.added_by)] ||= []).push(i);
+  return Object.entries(by).map(([name, arr]) => `${plural(arr.length, 'new item')} from ${name}`).join(' · ');
+}
+
+// Small pop-up when the other person adds something while the app is open
+function announceNew() {
+  if (document.visibilityState !== 'visible' || !state.pendingNew.length) return;
+  const ids = new Set(state.items.map((i) => i.id));
+  const fresh = state.pendingNew.filter((i) => ids.has(i.id)); // skip ones already deleted again
+  state.pendingNew = [];
+  if (!fresh.length) return;
+  const by = names([...new Set(fresh.map((i) => who(i.added_by)))]);
+  const what = fresh.length <= 3 ? names(fresh.map((i) => `“${i.name}”`)) : `${fresh.length} items`;
+  const listIds = [...new Set(fresh.map((i) => i.list_id))];
+  const l = listIds.length === 1 ? state.lists.find((x) => x.id === listIds[0]) : null;
+  const where = l ? ` to ${l.emoji ? l.emoji + ' ' : ''}${l.name}` : '';
+  toast(`${by} added ${what}${where}`, () => {
+    setCurrent(listIds[0]);
+    if (parseRoute().section === 'shopping') renderView(); else location.hash = 'shopping';
+  });
+}
+
+// Red number on the Shopping tab
+function updateBadges() {
+  const b = $('shop-badge');
+  if (!b) return;
+  const n = parseRoute().section === 'shopping' ? 0 : unseenItems().length;
+  b.hidden = !n;
+  b.textContent = n > 9 ? '9+' : String(n);
+  b.closest('button')?.setAttribute('aria-label', n ? `Shopping, ${n} new` : 'Shopping');
 }
 
 function subscribe() {
@@ -307,7 +384,7 @@ function renderMain() {
     <header class="top">
       <a class="brand" href="#home" aria-label="Home">${ICON}</a>
       <nav class="sections" id="nav">
-        ${SECTIONS.map((s) => `<button data-section="${s.id}" aria-label="${esc(s.label)}">${s.icon ? `<span class="ico">${s.icon}</span><span class="lbl">${esc(s.label)}</span>` : esc(s.label)}</button>`).join('')}
+        ${SECTIONS.map((s) => `<button data-section="${s.id}" aria-label="${esc(s.label)}">${s.icon ? `<span class="ico">${s.icon}</span><span class="lbl">${esc(s.label)}</span>` : esc(s.label)}${s.id === 'shopping' ? '<span class="badge" id="shop-badge" hidden></span>' : ''}</button>`).join('')}
       </nav>
       <div class="me"><span class="nm">${esc(me?.display_name)} ·</span> <button class="link" id="signout">Sign out</button></div>
     </header>
@@ -342,8 +419,11 @@ function renderView() {
   if (r.section === 'home') {
     renderHome();
   } else if (r.section === 'shopping') {
+    // Remember where "new" starts for this visit, so New tags stay until you leave the tab
+    if (changed || state.newSince === null) state.newSince = shopSeen();
     if (state.view !== 'shopping') buildShopping();
     renderShopping();
+    markShopSeen();
   } else if (r.section === 'ideas') {
     if (changed) state.editIdea = null;
     renderIdeas(!changed);
@@ -351,6 +431,7 @@ function renderView() {
     if (changed) { state.editTask = null; state.editLink = null; }
     renderProjects(r.sub, !changed);
   }
+  updateBadges();
   if (changed) window.scrollTo(0, 0);
 }
 
@@ -385,10 +466,12 @@ function renderShopping() {
 }
 
 function renderChips() {
+  const fresh = unseenItems(state.newSince ?? shopSeen());
   $('chips').innerHTML = state.lists.map((l) => {
     const open = state.items.filter((i) => i.list_id === l.id && !i.checked).length;
+    const isNew = fresh.some((i) => i.list_id === l.id);
     return `<button class="chip ${l.id === state.currentListId ? 'active' : ''}" data-id="${l.id}">
-      ${l.emoji ? `<span>${esc(l.emoji)}</span>` : ''}${esc(l.name)}${open ? ` <span class="n">${open}</span>` : ''}
+      ${l.emoji ? `<span>${esc(l.emoji)}</span>` : ''}${esc(l.name)}${open ? ` <span class="n">${open}</span>` : ''}${isNew ? '<span class="newdot" title="New items"></span>' : ''}
     </button>`;
   }).join('') + `<button class="chip newlist" data-act="new">+ New list</button>`;
 }
@@ -456,11 +539,12 @@ function renderItems() {
 
 function row(i) {
   const meta = i.checked ? `Checked by ${who(i.checked_by)}` : `Added by ${who(i.added_by)}`;
+  const isNew = !i.checked && isFromOther(i) && state.newSince !== null && i.created_at > state.newSince;
   return `
-    <li class="item ${i.checked ? 'checked' : ''}" data-id="${i.id}">
+    <li class="item ${i.checked ? 'checked' : ''} ${isNew ? 'is-new' : ''}" data-id="${i.id}">
       <button class="check" data-act="toggle" aria-label="${i.checked ? 'Uncheck' : 'Check'} ${esc(i.name)}">${TICK}</button>
       <div class="body" data-act="toggle">
-        <div class="name">${esc(i.name)}${i.quantity ? `<span class="qty">${esc(i.quantity)}</span>` : ''}</div>
+        <div class="name">${isNew ? '<span class="tag new">New</span>' : ''}${esc(i.name)}${i.quantity ? `<span class="qty">${esc(i.quantity)}</span>` : ''}</div>
         <div class="meta">${esc(meta)}</div>
       </div>
       ${itemMenu(i)}
@@ -1687,6 +1771,7 @@ function homeHTML() {
 
   // Shopping: everything not yet checked off, across all lists
   const openItems = state.items.filter((i) => !i.checked);
+  const freshItems = unseenItems();
   const perList = state.lists
     .map((l) => ({ l, n: openItems.filter((i) => i.list_id === l.id).length }))
     .filter((x) => x.n);
@@ -1709,6 +1794,7 @@ function homeHTML() {
       <div class="stat" data-act="go-shopping" role="link" tabindex="0">
         <div class="stat-num">${openItems.length}</div>
         <div class="stat-label">${openItems.length === 1 ? 'item' : 'items'} on the shopping list</div>
+        ${freshItems.length ? `<div class="stat-new">${esc(newSummary(freshItems))}</div>` : ''}
         ${perList.length ? `<div class="stat-chips">${perList.map(({ l, n }) => `
           <button class="mini" data-act="open-list" data-id="${l.id}">${l.emoji ? esc(l.emoji) + ' ' : ''}${esc(l.name)} <b>${n}</b></button>`).join('')}</div>`
           : '<div class="stat-sub">All bought 🎉</div>'}
@@ -1897,8 +1983,11 @@ async function onHomeClick(e) {
       setCurrent(el.dataset.id);
       location.hash = 'shopping';
       return;
-    case 'go-shopping':
+    case 'go-shopping': {
+      const first = unseenItems()[0]; // jump to the list with something new on it
+      if (first) setCurrent(first.list_id);
       location.hash = 'shopping';
+    }
       return;
     case 'go-projects':
       // Show the same "live" projects the count refers to
