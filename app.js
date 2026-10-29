@@ -69,8 +69,9 @@ const state = {
   // Home (front page)
   homeReady: false,
   homeError: '',
-  household: null,   // { photo_path, photo_by, photo_at }
-  photoBusy: false,
+  photosReady: false, // true when the home_photos table (06 SQL) exists
+  homePhotos: [],     // [{ id, path, added_by, added_at }] – front-page slideshow
+  photoBusy: '',      // e.g. "Uploading 2 of 3…" while adding photos
   // Ideas (suggestion box)
   ideasReady: false,
   ideasError: '',
@@ -1732,15 +1733,27 @@ const PHOTO_BUCKET = 'home-photos';
 const CAMERA = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="12" cy="13" r="3.5" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>`;
 
 async function loadHome() {
+  const r = await sb.from('home_photos').select('*').order('added_at');
+  if (!r.error) {
+    state.homeReady = true;
+    state.photosReady = true;
+    state.homePhotos = r.data;
+    return;
+  }
+  // Slideshow table not created yet – fall back to the single photo from 03_home.sql (read-only)
+  state.photosReady = false;
   const { data, error } = await sb.from('household').select('*').eq('id', 1).maybeSingle();
   if (error) {
-    console.warn('Home photo not available:', error);
+    console.warn('Home photos not available:', r.error, error);
     state.homeReady = false;
-    state.homeError = error.message;
+    state.homeError = r.error.message;
+    state.homePhotos = [];
     return;
   }
   state.homeReady = true;
-  state.household = data || null;
+  state.homePhotos = data?.photo_path
+    ? [{ id: 'legacy', path: data.photo_path, added_by: data.photo_by, added_at: data.photo_at }]
+    : [];
 }
 
 function renderHome() {
@@ -1750,9 +1763,18 @@ function renderHome() {
     view.onclick = onHomeClick;
     view.onchange = onHomeChange;
     view.onsubmit = null;
+    view.ontouchstart = onHomeTouchStart;
+    view.ontouchend = onHomeTouchEnd;
   }
+  syncShow();
+  // Keep the slideshow element as it is when nothing about it changed, so live updates
+  // elsewhere on the page don't make the photo blink or cut a fade short.
+  const oldHero = view.querySelector('.slides');
   keepWhileRendering(view, () => { view.innerHTML = homeHTML(); });
-  fillPhoto();
+  const newHero = view.querySelector('.slides');
+  if (oldHero && newHero && oldHero.dataset.sig === newHero.dataset.sig) newHero.replaceWith(oldHero);
+  fillPhotos();
+  armShow();
 }
 
 function plural(n, one, many = one + 's') { return `${n} ${n === 1 ? one : many}`; }
@@ -1816,30 +1838,54 @@ function homeHTML() {
 function photoHTML() {
   if (!state.homeReady) {
     return `<div class="hero empty-hero">
-      <p class="muted small">To add a shared photo here, run <code>supabase/03_home.sql</code> in Supabase → SQL Editor, then reload.</p>
+      <p class="muted small">To add photos here, run <code>supabase/06_home_photos.sql</code> in Supabase → SQL Editor, then reload.</p>
     </div>`;
   }
-  const hh = state.household;
-  const busy = state.photoBusy ? '<div class="hero-busy">Uploading…</div>' : '';
-  const input = `<input type="file" accept="image/*" hidden data-act="photo">`;
-  if (!hh?.photo_path) {
+  const busy = state.photoBusy ? `<div class="hero-busy">${esc(state.photoBusy)}</div>` : '';
+  const input = `<input type="file" accept="image/*" multiple hidden data-act="photo">`;
+  if (!state.homePhotos.length) {
+    if (!state.photosReady) {
+      return `<div class="hero empty-hero">
+        <p class="muted small">To add photos here, run <code>supabase/06_home_photos.sql</code> in Supabase → SQL Editor, then reload.</p>
+      </div>`;
+    }
     return `<label class="hero empty-hero add-photo">
       ${input}${busy}
       <span class="cam">${CAMERA}</span>
-      <b>Add a photo</b>
-      <span class="muted small">Pick one from your camera roll – you both see it here</span>
+      <b>Add photos</b>
+      <span class="muted small">Pick one or more from your camera roll – you both see them here as a slideshow</span>
     </label>`;
   }
-  const cached = photoCache.path === hh.photo_path ? photoCache.url : '';
-  return `<figure class="hero">
-      <img data-photo="${esc(hh.photo_path)}" ${cached ? `src="${esc(cached)}"` : ''} alt="Our home">
+  const ph = curPhoto();
+  const cached = cachedUrl(ph.path);
+  const many = state.homePhotos.length > 1;
+  const add = state.photosReady
+    ? `<label class="hero-btn">${input}${CAMERA}<span>Add</span></label>`
+    : `<button class="hero-btn wide" data-act="photos-need-sql">${CAMERA}<span>Add</span></button>`;
+  return `<figure class="hero slides" data-sig="${esc(heroSig())}">
+      <div class="slide-stack">
+        <img class="slide in" data-photo="${esc(ph.path)}" ${cached ? `src="${esc(cached)}"` : ''} alt="Our home">
+      </div>
+      ${many ? `<button class="slide-nav prev" data-act="slide-prev" aria-label="Previous photo"></button>
+      <button class="slide-nav next" data-act="slide-next" aria-label="Next photo"></button>` : ''}
       ${busy}
       <div class="hero-actions">
-        <label class="hero-btn">${input}${CAMERA}<span>Change</span></label>
-        <button class="hero-btn" data-act="photo-remove" aria-label="Remove photo">×</button>
+        ${many ? `<span class="hero-count" title="Photos in the slideshow">${state.homePhotos.length}</span>` : ''}
+        ${add}
+        ${state.photosReady ? `<button class="hero-btn" data-act="photo-remove" aria-label="Remove this photo">×</button>` : ''}
       </div>
-      ${hh.photo_by ? `<figcaption>Photo by ${esc(personName(hh.photo_by))}${hh.photo_at ? ` · ${fmtDate(hh.photo_at.slice(0, 10))}` : ''}</figcaption>` : ''}
+      <figcaption>${captionText(ph)}</figcaption>
     </figure>`;
+}
+
+function captionText(ph) {
+  if (!ph?.added_by) return '';
+  return `Added by ${esc(personName(ph.added_by))}${ph.added_at ? ` · ${fmtDate(ph.added_at.slice(0, 10))}` : ''}`;
+}
+
+// Everything the slideshow element shows; if this is unchanged, a re-render keeps the old element
+function heroSig() {
+  return [show.cur, state.homePhotos.length, state.photosReady, state.photoBusy].join('|');
 }
 
 function todosHTML(live) {
@@ -1902,20 +1948,151 @@ function todoRow(t) {
     </li>`;
 }
 
-// ---------- Shared photo ----------
-const photoCache = { path: null, url: null, exp: 0 };
+// ---------- Slideshow (random order) ----------
+const SLIDE_MS = 6000;   // how long each photo is shown
+const FADE_MS = 900;     // keep in sync with .slide transition in style.css
+const show = {
+  cur: null,       // path of the photo on screen
+  queue: [],       // paths still to come in this round (shuffled)
+  history: [],     // paths already shown (for "previous")
+  known: null,     // paths we had at the last sync – anything else is new
+  timer: null,
+};
+const urlCache = new Map(); // path → { url, exp }
 
-async function fillPhoto() {
-  const img = $('view').querySelector('img[data-photo]');
-  if (!img) return;
-  const path = img.dataset.photo;
-  if (!(photoCache.path === path && photoCache.exp > Date.now() + 60000)) {
-    const { data, error } = await sb.storage.from(PHOTO_BUCKET).createSignedUrl(path, 86400);
-    if (error) return console.warn(error);
-    Object.assign(photoCache, { path, url: data.signedUrl, exp: Date.now() + 86400 * 1000 });
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
   }
-  const cur = $('view').querySelector('img[data-photo]');
-  if (cur && cur.dataset.photo === path && cur.src !== photoCache.url) cur.src = photoCache.url;
+  return a;
+}
+
+const curPhoto = () => state.homePhotos.find((p) => p.path === show.cur) || state.homePhotos[0];
+
+// Line the slideshow up with the photos in the database (after every load / live update)
+function syncShow() {
+  const all = state.homePhotos.map((p) => p.path);
+  const has = new Set(all);
+  show.queue = show.queue.filter((p) => has.has(p) && p !== show.cur);
+  show.history = show.history.filter((p) => has.has(p));
+  if (!all.length) { show.cur = null; show.known = has; return; }
+  if (!show.known || !has.has(show.cur)) {
+    if (!show.known) show.cur = all[Math.floor(Math.random() * all.length)];
+    else show.cur = takeNext();
+  } else {
+    // Photos the other person just added come up next
+    const fresh = all.filter((p) => !show.known.has(p) && p !== show.cur && !show.queue.includes(p));
+    show.queue.unshift(...shuffle(fresh));
+  }
+  show.known = has;
+}
+
+// Next photo in random order; when everything has been shown, reshuffle (never the same twice in a row)
+function takeNext() {
+  const all = state.homePhotos.map((p) => p.path);
+  show.queue = show.queue.filter((p) => all.includes(p) && p !== show.cur);
+  if (!show.queue.length) show.queue = shuffle(all.filter((p) => p !== show.cur));
+  return show.queue.shift() ?? show.cur ?? all[0] ?? null;
+}
+
+function armShow() {
+  if (show.timer || state.homePhotos.length < 2) return;
+  show.timer = setTimeout(() => {
+    show.timer = null;
+    // Not on the front page or app in the background: stop; renderHome starts it again
+    if (state.screen !== 'main' || state.view !== 'home' || document.hidden) return;
+    goSlide(1);
+  }, SLIDE_MS);
+}
+
+function restartShow() {
+  clearTimeout(show.timer);
+  show.timer = null;
+  armShow();
+}
+
+function goSlide(dir) {
+  if (state.homePhotos.length < 2) return;
+  let next;
+  if (dir < 0) {
+    if (!show.history.length) return restartShow();
+    next = show.history.pop();
+    if (show.cur) show.queue.unshift(show.cur);
+  } else {
+    next = takeNext();
+    if (show.cur && next !== show.cur) {
+      show.history.push(show.cur);
+      if (show.history.length > 50) show.history.shift();
+    }
+  }
+  showSlide(next);
+  restartShow();
+}
+
+// Fade to a photo without re-rendering the page
+async function showSlide(path) {
+  show.cur = path;
+  const hero = $('view')?.querySelector('.slides');
+  if (!hero) return;
+  hero.dataset.sig = heroSig();
+  const cap = hero.querySelector('figcaption');
+  if (cap) cap.innerHTML = captionText(curPhoto());
+  const url = await signedUrl(path);
+  if (!url || show.cur !== path || !hero.isConnected) return;
+  const img = new Image();
+  img.className = 'slide';
+  img.alt = 'Our home';
+  img.dataset.photo = path;
+  img.src = url;
+  try { await img.decode(); } catch { /* show it anyway */ }
+  if (show.cur !== path || !hero.isConnected) return;
+  const stack = hero.querySelector('.slide-stack');
+  const old = [...stack.querySelectorAll('img.slide')];
+  stack.append(img);
+  requestAnimationFrame(() => requestAnimationFrame(() => img.classList.add('in')));
+  setTimeout(() => old.forEach((o) => o.remove()), FADE_MS + 100);
+  preloadNext();
+}
+
+// ---------- Photo links (private bucket → signed links, cached for a day) ----------
+function cachedUrl(path) {
+  const c = urlCache.get(path);
+  return c && c.exp > Date.now() + 60000 ? c.url : '';
+}
+
+async function signedUrls(paths) {
+  const missing = [...new Set(paths)].filter((p) => p && !cachedUrl(p));
+  if (missing.length) {
+    const { data, error } = await sb.storage.from(PHOTO_BUCKET).createSignedUrls(missing, 86400);
+    if (error) console.warn(error);
+    for (const d of data || []) {
+      if (d.signedUrl) urlCache.set(d.path, { url: d.signedUrl, exp: Date.now() + 86400 * 1000 });
+    }
+  }
+}
+
+async function signedUrl(path) {
+  await signedUrls([path]);
+  return cachedUrl(path);
+}
+
+// After rendering: fetch links for all photos in one go, fill in the one on screen, warm up the next
+async function fillPhotos() {
+  if (!state.homePhotos.length) return;
+  await signedUrls(state.homePhotos.map((p) => p.path));
+  for (const img of $('view').querySelectorAll('img[data-photo]')) {
+    const url = cachedUrl(img.dataset.photo);
+    if (url && img.getAttribute('src') !== url) img.src = url;
+  }
+  preloadNext();
+}
+
+function preloadNext() {
+  if (!show.queue.length && state.homePhotos.length > 1) show.queue = shuffle(state.homePhotos.map((p) => p.path).filter((p) => p !== show.cur));
+  const url = cachedUrl(show.queue[0]);
+  if (url) new Image().src = url;
 }
 
 // Resize to max 2000px and save as JPEG (keeps uploads small and fast)
@@ -1936,41 +2113,82 @@ async function prepPhoto(file) {
   } catch { return file; } // e.g. HEIC on a browser that can't read it – upload as is
 }
 
-async function setHomePhoto(file) {
-  if (!file) return;
-  state.photoBusy = true;
-  renderView();
-  try {
-    const blob = await prepPhoto(file);
-    const type = blob.type || file.type || 'image/jpeg';
-    const ext = type === 'image/jpeg' ? 'jpg' : (file.name.split('.').pop() || 'img').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const path = `home/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-    const up = await sb.storage.from(PHOTO_BUCKET).upload(path, blob, { contentType: type });
-    if (up.error) throw up.error;
-    const old = state.household?.photo_path;
-    const row = { id: 1, photo_path: path, photo_by: uid(), photo_at: new Date().toISOString() };
-    const { error } = await sb.from('household').upsert(row);
-    if (error) { await sb.storage.from(PHOTO_BUCKET).remove([path]); throw error; }
-    state.household = { ...(state.household || {}), ...row };
-    if (old && old !== path) sb.storage.from(PHOTO_BUCKET).remove([old]);
-    toast('Photo updated');
-  } catch (err) {
-    toast(err.message || 'Upload failed');
+async function addHomePhotos(files) {
+  files = [...files].filter((f) => f && (!f.type || f.type.startsWith('image/')));
+  if (!files.length) return;
+  if (!state.photosReady) return toast('Run supabase/06_home_photos.sql in Supabase first');
+  const added = [];
+  let failed = 0;
+  for (const [n, file] of files.entries()) {
+    state.photoBusy = files.length > 1 ? `Uploading ${n + 1} of ${files.length}…` : 'Uploading…';
+    renderView();
+    try {
+      const blob = await prepPhoto(file);
+      const type = blob.type || file.type || 'image/jpeg';
+      const ext = type === 'image/jpeg' ? 'jpg' : (file.name.split('.').pop() || 'img').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const path = `home/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      const up = await sb.storage.from(PHOTO_BUCKET).upload(path, blob, { contentType: type });
+      if (up.error) throw up.error;
+      const { data, error } = await sb.from('home_photos').insert({ path, added_by: uid() }).select().single();
+      if (error) { await sb.storage.from(PHOTO_BUCKET).remove([path]); throw error; }
+      added.push(data);
+      if (!state.homePhotos.some((p) => p.path === path)) state.homePhotos.push(data);
+      show.known?.add(path);
+    } catch (err) {
+      console.warn(err);
+      failed++;
+      if (files.length === 1) toast(err.message || 'Upload failed');
+    }
   }
-  state.photoBusy = false;
+  state.photoBusy = '';
+  if (added.length) {
+    // Show what you just added straight away; the rest of the new ones come next
+    if (show.cur) show.history.push(show.cur);
+    show.cur = added[0].path;
+    show.queue = [...shuffle(added.slice(1).map((p) => p.path)), ...show.queue.filter((p) => !added.some((a) => a.path === p))];
+    if (files.length > 1) toast(`${plural(added.length, 'photo')} added${failed ? ` · ${failed} failed` : ''}`);
+    else toast('Photo added');
+  } else if (files.length > 1) {
+    toast('Upload failed');
+  }
   renderView();
+  restartShow();
 }
 
 async function removeHomePhoto() {
-  const old = state.household?.photo_path;
-  if (!old || !confirm('Remove the photo from the front page?')) return;
-  const row = { id: 1, photo_path: null, photo_by: null, photo_at: null };
-  const { error } = await sb.from('household').upsert(row);
+  const ph = curPhoto();
+  if (!ph || !state.photosReady) return;
+  if (!confirm('Remove this photo from the front page?')) return;
+  const { error } = await sb.from('home_photos').delete().eq('id', ph.id);
   if (error) return toast(error.message);
-  state.household = { ...(state.household || {}), ...row };
-  sb.storage.from(PHOTO_BUCKET).remove([old]);
+  state.homePhotos = state.homePhotos.filter((p) => p.id !== ph.id);
+  sb.storage.from(PHOTO_BUCKET).remove([ph.path]);
+  urlCache.delete(ph.path);
+  show.cur = state.homePhotos.length ? takeNext() : null;
+  show.known?.delete(ph.path);
+  toast('Photo removed');
   renderView();
+  restartShow();
 }
+
+// Swipe left/right on the photo
+let swipe = null;
+function onHomeTouchStart(e) {
+  swipe = e.target.closest('.slides') && e.touches.length === 1
+    ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : null;
+}
+function onHomeTouchEnd(e) {
+  if (!swipe) return;
+  const t = e.changedTouches[0];
+  const dx = t.clientX - swipe.x;
+  const dy = t.clientY - swipe.y;
+  swipe = null;
+  if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+    swipeDone = Date.now();
+    goSlide(dx < 0 ? 1 : -1);
+  }
+}
+let swipeDone = 0;
 
 // ---------- Home actions ----------
 async function onHomeClick(e) {
@@ -1979,6 +2197,11 @@ async function onHomeClick(e) {
   switch (el.dataset.act) {
     case 'photo': return; // the file input handles itself
     case 'photo-remove': return removeHomePhoto();
+    case 'photos-need-sql': return toast('To add more photos, run supabase/06_home_photos.sql in Supabase');
+    case 'slide-prev':
+    case 'slide-next':
+      if (Date.now() - swipeDone < 400) return; // the swipe already moved it
+      return goSlide(el.dataset.act === 'slide-next' ? 1 : -1);
     case 'open-list':
       setCurrent(el.dataset.id);
       location.hash = 'shopping';
@@ -2007,9 +2230,9 @@ async function onHomeClick(e) {
 function onHomeChange(e) {
   const el = e.target;
   if (el.type === 'file' && el.dataset.act === 'photo') {
-    const file = el.files[0];
+    const files = [...el.files];
     el.value = '';
-    setHomePhoto(file);
+    addHomePhotos(files);
   }
 }
 

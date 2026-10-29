@@ -3,7 +3,7 @@
 A shared web app for organizing the apartment. Built section by section.
 
 **Sections**
-- ✅ Home: front page with a shared photo, shopping & project counts, and everyone's to-dos
+- ✅ Home: front page with a photo slideshow (you both add photos; they change every few seconds in random order – swipe or tap the sides to skip), shopping & project counts, and everyone's to-dos
 - ✅ Shopping lists: several lists, categories (incl. your own and one-time ones), move items between lists, check off, see who added what, live sync, and a heads-up when the other person adds something (pop-up, red number on the Shopping tab, *New* tags)
 - ✅ Projects: by room, type, priority and status; tasks & next steps, links to solutions, budget & costs, photos & files, notes
 - ✅ Ideas: a suggestion box for new features – status (new / planned / done / not now), 👍 to agree, copy the open ones as a list
@@ -14,7 +14,7 @@ A shared web app for organizing the apartment. Built section by section.
 - Data and logins in Supabase. Only users created in Supabase can sign in.
 
 ## Setup (one time)
-1. **Database:** Supabase → SQL Editor → paste `supabase/01_shopping.sql` → Run. Then do the same with `supabase/02_projects.sql`, `supabase/03_home.sql`, `supabase/04_suggestions.sql` and `supabase/05_shopping_categories.sql`.
+1. **Database:** Supabase → SQL Editor → paste `supabase/01_shopping.sql` → Run. Then do the same with `supabase/02_projects.sql`, `supabase/03_home.sql`, `supabase/04_suggestions.sql`, `supabase/05_shopping_categories.sql` and `supabase/06_home_photos.sql` (in that order).
 2. **Turn off public sign-ups:** Supabase → Authentication → Sign In / Providers → turn off *Allow new users to sign up* → Save.
 3. **Create the two users:** Authentication → Users → Add user → Create new user (email + password, tick *Auto Confirm User*).
 4. **Publish:** GitHub repo → Settings → Pages → Deploy from a branch → `main` / `(root)` → Save.
