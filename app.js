@@ -42,6 +42,11 @@ const state = {
   lists: [],
   items: [],
   currentListId: store('currentListId'),
+  // Shopping categories you add yourselves (shared). One-time ones live only on the item.
+  catsReady: false,
+  customCats: [],
+  onceCat: null,     // one-time category picked in the add form (this session only)
+  showCats: false,   // "Categories" panel open
   channel: null,
   view: null,        // which section's markup is currently in #view
   route: null,       // last rendered hash route
@@ -194,8 +199,20 @@ async function loadAll() {
   if (!state.lists.some((x) => x.id === state.currentListId)) {
     setCurrent(state.lists[0]?.id ?? null);
   }
-  await Promise.all([loadProjects(), loadHome(), loadIdeas()]);
+  await Promise.all([loadShopCats(), loadProjects(), loadHome(), loadIdeas()]);
   return true;
+}
+
+async function loadShopCats() {
+  const { data, error } = await sb.from('shopping_categories').select('*').order('position').order('created_at');
+  if (error) {
+    console.warn('Custom categories not available:', error);
+    state.catsReady = false;
+    state.customCats = [];
+    return;
+  }
+  state.catsReady = true;
+  state.customCats = data;
 }
 
 function setCurrent(id) {
@@ -348,9 +365,7 @@ function buildShopping() {
       <form id="add" class="add" autocomplete="off">
         <input name="name" placeholder="Add an item…" required maxlength="80" aria-label="Item">
         <input name="qty" placeholder="Qty" maxlength="20" aria-label="Quantity">
-        <select name="cat" aria-label="Category">
-          ${CATEGORIES.map((c) => `<option>${esc(c)}</option>`).join('')}
-        </select>
+        <select name="cat" aria-label="Category"></select>
         <button class="btn primary" type="submit">Add</button>
       </form>
       <div id="items"></div>`;
@@ -358,11 +373,13 @@ function buildShopping() {
   $('chips').onclick = onChipClick;
   $('listhead').onclick = onListHeadClick;
   $('items').onclick = onItemsClick;
+  $('items').onchange = onItemsChange;
 }
 
 function renderShopping() {
   renderChips();
   renderListHead();
+  fillAddCats();
   renderItems();
   $('add').style.display = currentList() ? '' : 'none';
 }
@@ -381,9 +398,24 @@ function renderListHead() {
   $('listhead').innerHTML = l ? `
     <div class="listhead">
       <h1>${l.emoji ? esc(l.emoji) + ' ' : ''}${esc(l.name)}</h1>
+      <button class="link ${state.showCats ? 'on' : ''}" data-act="cats" aria-expanded="${state.showCats}">Categories</button>
       <button class="link" data-act="rename">Rename</button>
       <button class="link" data-act="delete">Delete</button>
-    </div>` : '';
+    </div>${state.showCats ? catPanelHTML() : ''}` : '';
+}
+
+function catPanelHTML() {
+  if (!state.catsReady) {
+    return `<div class="catpanel"><p>To save your own categories, run <code>supabase/05_shopping_categories.sql</code> in Supabase (SQL Editor → Run). One-time categories already work – pick <b>✎ One-time category…</b> in the category menu.</p></div>`;
+  }
+  return `
+    <div class="catpanel">
+      <p>Your own categories – shared, and available on every list. Removing one doesn't change items that already use it.</p>
+      <div class="catchips">
+        ${state.customCats.map((c) => `<span class="catchip">${esc(c.name)}<button data-act="cat-del" data-id="${c.id}" aria-label="Remove category ${esc(c.name)}">×</button></span>`).join('')}
+        <button class="chip newlist" data-act="cat-add">+ New category</button>
+      </div>
+    </div>`;
 }
 
 function renderItems() {
@@ -400,8 +432,7 @@ function renderItems() {
 
   const groups = {};
   for (const it of open) (groups[it.category] ||= []).push(it);
-  const order = (c) => { const i = CATEGORIES.indexOf(c); return i === -1 ? 999 : i; };
-  const cats = Object.keys(groups).sort((a, b) => order(a) - order(b) || a.localeCompare(b));
+  const cats = Object.keys(groups).sort((a, b) => catRank(a) - catRank(b) || a.localeCompare(b));
 
   let html = cats.map((c) => `
     <section class="group">
@@ -432,8 +463,89 @@ function row(i) {
         <div class="name">${esc(i.name)}${i.quantity ? `<span class="qty">${esc(i.quantity)}</span>` : ''}</div>
         <div class="meta">${esc(meta)}</div>
       </div>
+      ${itemMenu(i)}
       <button class="del" data-act="del" aria-label="Remove ${esc(i.name)}">×</button>
     </li>`;
+}
+
+// ---------- Categories ----------
+// Order: built-ins → your saved ones → one-time ones → Other
+function allCats() {
+  const saved = state.customCats.map((c) => c.name).filter((n) => !CATEGORIES.includes(n));
+  return [...CATEGORIES.filter((c) => c !== 'Other'), ...saved, 'Other'];
+}
+
+function catRank(c) {
+  if (c === 'Other') return 9999;
+  const b = CATEGORIES.indexOf(c);
+  if (b !== -1) return b;
+  const s = state.customCats.findIndex((x) => x.name === c);
+  return s !== -1 ? 100 + s : 5000;
+}
+
+// Reuse an existing category if the name only differs in upper/lower case
+function matchCat(name) {
+  const n = name.trim().toLowerCase();
+  return allCats().find((c) => c.toLowerCase() === n) || null;
+}
+
+function shopCatOptions(once) {
+  const cats = allCats();
+  const extra = once && !cats.includes(once) ? `<option value="${esc(once)}">${esc(once)} (one-time)</option>` : '';
+  return extra + cats.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join('') +
+    `<option value="__new">＋ New category…</option><option value="__once">✎ One-time category…</option>`;
+}
+
+// (Re)build the add form's category menu, keeping the current choice
+function fillAddCats(want) {
+  const sel = $('add')?.elements.cat;
+  if (!sel) return;
+  const cur = want ?? (sel.value && !sel.value.startsWith('__') ? sel.value : store('lastCategory') || 'Other');
+  const sig = JSON.stringify([allCats(), state.onceCat]);
+  if (sel.dataset.sig !== sig) { sel.innerHTML = shopCatOptions(state.onceCat); sel.dataset.sig = sig; }
+  sel.value = allCats().includes(cur) || cur === state.onceCat ? cur : 'Other';
+}
+
+async function addShopCategory() {
+  if (!state.catsReady) {
+    toast('Run supabase/05_shopping_categories.sql in Supabase first – or use a one-time category.');
+    return null;
+  }
+  const name = await ask('New category', '', 'Add');
+  if (!name) return null;
+  const existing = matchCat(name);
+  if (existing) return existing;
+  const position = Math.max(-1, ...state.customCats.map((c) => c.position)) + 1;
+  const { data, error } = await sb.from('shopping_categories').insert({ name, position, created_by: uid() }).select().single();
+  if (error) { toast(error.message); return null; }
+  if (!state.customCats.some((x) => x.id === data.id)) state.customCats.push(data);
+  toast(`Category "${data.name}" added`);
+  return data.name;
+}
+
+async function askOnceCat() {
+  const name = await ask('One-time category', '', 'Use');
+  return name ? matchCat(name) || name : null;
+}
+
+// "⋯" menu on each item: move to another list or change category.
+// A native <select> sits invisibly on top of the button, so phones show their own picker.
+function itemMenu(i) {
+  const others = state.lists.filter((l) => l.id !== i.list_id);
+  const cats = allCats();
+  if (!cats.includes(i.category)) cats.unshift(i.category);
+  return `
+      <label class="more" title="Move or change category">⋯
+        <select data-act="item-menu" aria-label="Move or change category for ${esc(i.name)}">
+          <option value="" selected disabled>${esc(i.name)}</option>
+          ${others.length ? `<optgroup label="Move to list">${others.map((l) => `<option value="list:${l.id}">${l.emoji ? esc(l.emoji) + ' ' : ''}${esc(l.name)}</option>`).join('')}</optgroup>` : ''}
+          <optgroup label="Change category">
+            ${cats.map((c) => `<option value="cat:${esc(c)}">${c === i.category ? '✓ ' : ''}${esc(c)}</option>`).join('')}
+            <option value="cat-new">＋ New category…</option>
+            <option value="cat-once">✎ One-time category…</option>
+          </optgroup>
+        </select>
+      </label>`;
 }
 
 function guessCategory(text) {
@@ -456,13 +568,24 @@ function setupAddForm() {
   const nameInput = form.elements.name;
   const select = form.elements.cat;
   let manualCategory = false;
-  select.value = store('lastCategory') || 'Other';
+  let prevCat = null;
+  fillAddCats();
+  prevCat = select.value;
 
-  select.onchange = () => { manualCategory = true; };
+  select.onchange = async () => {
+    const v = select.value;
+    if (v === '__new' || v === '__once') {
+      const name = v === '__new' ? await addShopCategory() : await askOnceCat();
+      if (name && !allCats().includes(name)) state.onceCat = name;
+      fillAddCats(name || prevCat);
+    }
+    prevCat = select.value;
+    manualCategory = true;
+  };
   nameInput.oninput = () => {
     if (manualCategory) return;
     const g = guessCategory(nameInput.value.trim());
-    if (g) select.value = g;
+    if (g) { select.value = g; prevCat = g; }
   };
 
   form.onsubmit = async (e) => {
@@ -477,7 +600,7 @@ function setupAddForm() {
       category: select.value,
       added_by: uid(),
     };
-    store('lastCategory', select.value);
+    if (select.value !== state.onceCat) store('lastCategory', select.value);
     nameInput.value = '';
     form.elements.qty.value = '';
     manualCategory = false;
@@ -509,9 +632,28 @@ async function newList() {
 }
 
 async function onListHeadClick(e) {
-  const act = e.target.closest('[data-act]')?.dataset.act;
+  const actEl = e.target.closest('[data-act]');
+  const act = actEl?.dataset.act;
   const l = currentList();
   if (!l) return;
+  if (act === 'cats') {
+    state.showCats = !state.showCats;
+    renderListHead();
+  }
+  if (act === 'cat-add') {
+    if (await addShopCategory()) renderShopping();
+  }
+  if (act === 'cat-del') {
+    const c = state.customCats.find((x) => x.id === actEl.dataset.id);
+    if (!c) return;
+    const used = state.items.filter((i) => i.category === c.name).length;
+    const note = used ? `\n\n${used} item${used === 1 ? '' : 's'} still use it – they keep the category.` : '';
+    if (!confirm(`Remove the category "${c.name}"?${note}`)) return;
+    state.customCats = state.customCats.filter((x) => x.id !== c.id);
+    renderShopping();
+    const { error } = await sb.from('shopping_categories').delete().eq('id', c.id);
+    if (error) { toast(error.message); refresh(); }
+  }
   if (act === 'rename') {
     const name = await ask('Rename list', l.name);
     if (!name || name === l.name) return;
@@ -560,6 +702,36 @@ async function onItemsClick(e) {
     const { error } = await sb.from('items').delete().eq('id', id);
     if (error) { toast(error.message); refresh(); }
   }
+}
+
+async function onItemsChange(e) {
+  const sel = e.target.closest('select[data-act="item-menu"]');
+  if (!sel) return;
+  const v = sel.value;
+  sel.value = '';
+  const it = state.items.find((x) => x.id === sel.closest('.item')?.dataset.id);
+  if (!it || !v) return;
+
+  if (v.startsWith('list:')) {
+    const to = state.lists.find((l) => l.id === v.slice(5));
+    if (!to) return;
+    it.list_id = to.id;
+    renderShopping();
+    toast(`Moved "${it.name}" to ${to.emoji ? to.emoji + ' ' : ''}${to.name}`);
+    const { error } = await sb.from('items').update({ list_id: to.id }).eq('id', it.id);
+    if (error) { toast(error.message); refresh(); }
+    return;
+  }
+
+  let cat = null;
+  if (v.startsWith('cat:')) cat = v.slice(4);
+  else if (v === 'cat-new') cat = await addShopCategory();
+  else if (v === 'cat-once') cat = await askOnceCat();
+  if (!cat || cat === it.category) { renderShopping(); return; }
+  it.category = cat;
+  renderShopping();
+  const { error } = await sb.from('items').update({ category: cat }).eq('id', it.id);
+  if (error) { toast(error.message); refresh(); }
 }
 
 async function clearChecked() {
